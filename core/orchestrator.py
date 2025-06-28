@@ -49,6 +49,11 @@ class TradingOrchestrator:
         self.running = False
         self.last_candle_time = None
         self.current_date = None
+        
+        # Tick data aggregation
+        self.current_minute = None
+        self.current_candle = None
+        self.ticks_buffer = []
     
     def _setup_logging(self) -> None:
         """Configure logging for the application."""
@@ -168,6 +173,11 @@ class TradingOrchestrator:
         # Initialize real-time data subscription
         self._setup_realtime_data()
         
+        # Initialize tick data structures
+        self.current_minute = None
+        self.current_candle = None
+        self.ticks_buffer = []
+        
         # Main trading loop
         self.running = True
         while self.running:
@@ -177,28 +187,27 @@ class TradingOrchestrator:
                 # Check if market is open
                 if not self._is_market_hours():
                     if self._is_market_closed():
+                        # Process any remaining ticks before closing
+                        if self.current_candle:
+                            self._process_completed_candle()
                         # Square off all positions at EOD
                         self.trade_executor.square_off_all_positions()
-                        self.logger.info("Market is closed. Waiting for next trading day...")
-                        time.sleep(60)  # Check every minute
-                        continue
+                        self.logger.info("Market closed. Shutting down...")
+                        break
                     
-                    # Before market opens, prepare for the day
-                    self._prepare_for_trading_day()
+                    # Wait for market to open
+                    time.sleep(60)
+                    continue
                 
-                # Process any open positions
-                self.trade_executor.manage_positions()
-                
-                # Get latest candle data
-                latest_candle = self._get_latest_candle()
-                if latest_candle is not None:
-                    # Check for new signals
-                    signal = self._check_for_signals(latest_candle)
-                    if signal:
-                        self.trade_executor.execute_signal(signal)
+                # Process any ticks that have been received
+                if self.ticks_buffer:
+                    # Process ticks in batches to avoid blocking
+                    ticks_to_process = self.ticks_buffer.copy()
+                    self.ticks_buffer = []
+                    self._process_ticks(ticks_to_process)
                 
                 # Sleep to avoid excessive CPU usage
-                time.sleep(1)
+                time.sleep(0.1)  # 100ms sleep for better tick processing
                 
             except Exception as e:
                 self.logger.error(f"Error in live trading loop: {str(e)}", exc_info=True)
@@ -233,6 +242,51 @@ class TradingOrchestrator:
         self.logger.info(f"Loaded {len(df)} candles of historical data")
         return df
     
+    def _process_ticks(self, ticks: List[Dict[str, Any]]) -> None:
+        """Process a batch of ticks."""
+        if not ticks:
+            return
+            
+        try:
+            # Process each tick in the batch
+            for tick in ticks:
+                tick_time = tick.get('datetime', datetime.now(self.ist_tz))
+                if not isinstance(tick_time, datetime):
+                    tick_time = datetime.fromisoformat(tick_time) if isinstance(tick_time, str) else datetime.now(self.ist_tz)
+                
+                tick_price = float(tick.get('last', 0))
+                tick_volume = int(tick.get('volume', 0))
+                
+                # Initialize first candle if needed
+                if self.current_candle is None:
+                    self._initialize_new_candle(tick_time)
+                
+                # Check if we've moved to a new minute
+                current_minute = tick_time.replace(second=0, microsecond=0)
+                if current_minute > self.current_minute:
+                    # Process the completed candle
+                    self._process_completed_candle()
+                    # Start a new candle
+                    self._initialize_new_candle(tick_time)
+                
+                # Update current candle with tick data
+                if self.current_candle['open'] is None:
+                    self.current_candle['open'] = tick_price
+                
+                self.current_candle['high'] = max(
+                    self.current_candle['high'] or tick_price, 
+                    tick_price
+                )
+                self.current_candle['low'] = min(
+                    self.current_candle['low'] or tick_price, 
+                    tick_price
+                )
+                self.current_candle['close'] = tick_price
+                self.current_candle['volume'] += tick_volume
+                
+        except Exception as e:
+            self.logger.error(f"Error processing ticks: {str(e)}", exc_info=True)
+    
     def _setup_realtime_data(self) -> None:
         """Set up real-time data subscription."""
         symbol = self.config.get_trading_config().symbol
@@ -243,19 +297,101 @@ class TradingOrchestrator:
                 {
                     'stock_code': symbol,
                     'exchange_code': 'NSE',
-                    'product_type': 'cash'
+                    'product_type': 'cash',
+                    'get_exchange_quotes': True,
+                    'get_market_depth': False
                 }
             ],
             self._on_tick
         )
     
-    def _on_tick(self, ticks: List[Dict[str, Any]]) -> None:
-        """Handle incoming real-time ticks."""
-        for tick in ticks:
-            self.logger.debug(f"Tick received: {tick}")
+    def _initialize_new_candle(self, tick_time: datetime) -> None:
+        """Initialize a new candle with the given timestamp."""
+        self.current_minute = tick_time.replace(second=0, microsecond=0)
+        self.current_candle = {
+            'datetime': self.current_minute,
+            'open': None,
+            'high': None,
+            'low': None,
+            'close': None,
+            'volume': 0,
+            'symbol': self.config.get_trading_config().symbol,
+            'interval': '1m'
+        }
+        self.ticks_buffer = []
+        self.logger.debug(f"Initialized new candle at {self.current_minute}")
+    
+    def _process_completed_candle(self) -> None:
+        """Process the completed candle and check for signals."""
+        if not self.current_candle or 'close' not in self.current_candle:
+            return
             
-            # Update latest candle if needed
-            # This is a simplified example - in a real implementation, you'd aggregate ticks into candles
+        self.logger.debug(
+            f"Completed 1m candle: {self.current_candle['datetime']} | "
+            f"O:{self.current_candle['open']:.2f} H:{self.current_candle['high']:.2f} "
+            f"L:{self.current_candle['low']:.2f} C:{self.current_candle['close']:.2f} "
+            f"V:{self.current_candle['volume']}"
+        )
+        
+        # Check for signals based on the completed candle
+        signal = self._check_for_signals(self.current_candle)
+        if signal:
+            self.trade_executor.execute_signal(signal)
+    
+    def _on_tick(self, ticks: List[Dict[str, Any]]) -> None:
+        """Handle incoming real-time ticks and aggregate into 1-minute candles.
+        
+        Args:
+            ticks: List of tick data dictionaries with 'last' price and 'volume'
+        """
+        if not ticks:
+            return
+            
+        for tick in ticks:
+            try:
+                tick_time = tick.get('datetime', datetime.now(self.ist_tz))
+                if not isinstance(tick_time, datetime):
+                    tick_time = datetime.fromisoformat(tick_time) if isinstance(tick_time, str) else datetime.now(self.ist_tz)
+                
+                tick_price = float(tick.get('last', 0))
+                tick_volume = int(tick.get('volume', 0))
+                
+                # Initialize first candle if needed
+                if self.current_candle is None:
+                    self._initialize_new_candle(tick_time)
+                
+                # Check if we've moved to a new minute
+                current_minute = tick_time.replace(second=0, microsecond=0)
+                if current_minute > self.current_minute:
+                    # Process the completed candle
+                    self._process_completed_candle()
+                    # Start a new candle
+                    self._initialize_new_candle(tick_time)
+                
+                # Update current candle with tick data
+                if self.current_candle['open'] is None:
+                    self.current_candle['open'] = tick_price
+                
+                self.current_candle['high'] = max(
+                    self.current_candle['high'] or tick_price, 
+                    tick_price
+                )
+                self.current_candle['low'] = min(
+                    self.current_candle['low'] or tick_price, 
+                    tick_price
+                )
+                self.current_candle['close'] = tick_price
+                self.current_candle['volume'] += tick_volume
+                
+                # Store tick in buffer (useful for more granular analysis if needed)
+                self.ticks_buffer.append({
+                    'datetime': tick_time,
+                    'price': tick_price,
+                    'volume': tick_volume
+                })
+                
+            except Exception as e:
+                self.logger.error(f"Error processing tick {tick}: {str(e)}", exc_info=True)
     
     def _check_for_signals(self, candle: Dict[str, Any]) -> Optional[TradeSignal]:
         """Check for trading signals based on the latest candle."""
