@@ -39,6 +39,11 @@ class TradeExecutor:
         # Trade and position tracking
         self.current_date = datetime.now(self.ist_tz).date()
         self.daily_trades_count = 0
+        
+        # Signal cooldown tracking
+        self.last_signal_time = None
+        self.min_candle_gap = self.trading_config.get('min_candle_gap_between_signals', 5)  # Default to 5 candles if not set
+        self.logger.info(f"Signal cooldown set to {self.min_candle_gap} candles")
     
     def _setup_logger(self) -> logging.Logger:
         """Set up logger for the trade executor."""
@@ -397,6 +402,28 @@ class TradeExecutor:
         except Exception as e:
             self.logger.error(f"Error placing bracket orders: {str(e)}")
     
+    def _is_in_cooldown(self) -> bool:
+        """Check if we're in a cooldown period after the last signal.
+        
+        Returns:
+            bool: True if in cooldown, False otherwise
+        """
+        if self.last_signal_time is None:
+            return False
+            
+        # Calculate time difference in minutes
+        time_diff = (datetime.now(self.ist_tz) - self.last_signal_time).total_seconds() / 60
+        
+        # Convert candle gap to minutes (assuming 1m candles)
+        cooldown_minutes = self.min_candle_gap * 1  # 1 minute per candle
+        
+        if time_diff < cooldown_minutes:
+            remaining = cooldown_minutes - time_diff
+            self.logger.debug(f"In cooldown period: {remaining:.1f} minutes remaining")
+            return True
+            
+        return False
+
     def _check_daily_trades_limit(self) -> bool:
         """Check if we've reached the maximum number of daily trades.
         
@@ -457,6 +484,11 @@ class TradeExecutor:
                 
             # Check daily trade limits
             if not self._check_daily_trades_limit():
+                return None
+                
+            # Check cooldown period
+            if self._is_in_cooldown():
+                self.logger.debug("Skipping signal: In cooldown period")
                 return None
                 
             # Check if we already have an open position for this signal
@@ -522,9 +554,11 @@ class TradeExecutor:
                 signal=signal  # Pass the signal for options parameters
             )
             
-            # Increment daily trade counter if order was placed successfully
+            # Update tracking if order was placed successfully
             if order and order.status == OrderStatus.COMPLETE:
                 self.daily_trades_count += 1
+                self.last_signal_time = datetime.now(self.ist_tz)
+                self.logger.debug(f"Signal executed at {self.last_signal_time}")
             
             if not order or order.status != OrderStatus.COMPLETE:
                 self.logger.error(f"Failed to place entry order for {signal}")
