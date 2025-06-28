@@ -55,19 +55,40 @@ class CandlePatternStrategy:
         return rsi
     
     def get_option_strike(self, spot_price: float, signal_type: str) -> int:
-        """Calculate the ITM+2 strike price based on signal type."""
+        """Calculate the ITM+2 strike price based on signal type.
+        
+        Args:
+            spot_price: Current spot price of the underlying
+            signal_type: Type of signal (LONG or SHORT)
+            
+        Returns:
+            int: Strike price that is ITM+2 based on the signal type, properly rounded
+                to the nearest strike step.
+        """
         strike_step = self.trading_config.strike_step
         strike_offset = self.options_config.strike_offset
         
-        if signal_type == TradeSignalType.LONG.value:
-            # For LONG (Call option), ITM+2 means 2 strikes below current price
-            strike = int(spot_price - (strike_offset * strike_step))
-        else:  # SHORT
-            # For SHORT (Put option), ITM+2 means 2 strikes above current price
-            strike = int(spot_price + (strike_offset * strike_step))
+        # Round to nearest ATM strike first
+        atm_strike = round(spot_price / strike_step) * strike_step
         
-        # Round to nearest strike step
+        if signal_type == TradeSignalType.LONG.value:
+            # For LONG (Call option), ITM+2 means 2 strikes below ATM
+            strike = atm_strike - (strike_offset * strike_step)
+        else:  # SHORT
+            # For SHORT (Put option), ITM+2 means 2 strikes above ATM
+            strike = atm_strike + (strike_offset * strike_step)
+        
+        # Ensure strike is a multiple of strike_step (sanity check)
         strike = int(round(strike / strike_step) * strike_step)
+        
+        self.logger.debug(
+            f"Strike selection - Spot: {spot_price:.2f}, "
+            f"Signal: {signal_type}, "
+            f"ATM: {atm_strike}, "
+            f"Offset: {strike_offset}, "
+            f"Final Strike: {strike}"
+        )
+        
         return strike
     
     def analyze_candle_pattern(self, df: pd.DataFrame, index: int) -> Tuple[Optional[str], Optional[TradeSignal]]:
