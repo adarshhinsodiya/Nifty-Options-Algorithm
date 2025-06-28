@@ -3,17 +3,33 @@ Data provider module for fetching and managing market data.
 Supports both real-time and historical data retrieval.
 """
 import os
+import time
+import random
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import pytz
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Callable, Any, TypeVar, Type
 import logging
 import json
 from pathlib import Path
+from functools import wraps
 
 from core.config_manager import ConfigManager
 from core.models import TradeSignal, TradeSignalType
+
+# Type variable for generic function return type
+T = TypeVar('T')
+
+# Custom exception for session expiry
+class SessionExpiredError(Exception):
+    """Raised when the Breeze API session has expired."""
+    pass
+
+# Custom exception for API errors
+class APIError(Exception):
+    """Raised when there's an error with the Breeze API."""
+    pass
 
 class DataProvider:
     """Handles data retrieval from various sources (live/historical)."""
@@ -31,7 +47,15 @@ class DataProvider:
         self.options_config = config.get_options_config()
         self.ist_tz = pytz.timezone('Asia/Kolkata')
         self.logger = self._setup_logger()
+        
+        # Breeze API related attributes
         self.breeze = None
+        self._session_token = None
+        self._session_expiry = None
+        self._last_api_call = None
+        self._max_retries = 3
+        self._initial_backoff = 1  # seconds
+        self._max_backoff = 30  # seconds
         
         if self.mode == 'live':
             self._initialize_breeze_api()
@@ -48,17 +72,14 @@ class DataProvider:
             
             api_creds = self.config.get_api_credentials()
             self.breeze = BreezeConnect(api_key=api_creds['api_key'])
+            self._api_secret = api_creds.get('api_secret')
             
             # Generate session token if not provided
             if not api_creds.get('session_token'):
-                # This requires user interaction in a real scenario
                 self.logger.warning("Session token not provided. Generate one using generate_session()")
             else:
-                self.breeze.generate_session(
-                    api_secret=api_creds['api_secret'],
-                    session_token=api_creds['session_token']
-                )
-                self.breeze.ws_connect()  # Connect to websocket for live data
+                self._session_token = api_creds['session_token']
+                self._renew_session()
                 
         except ImportError:
             self.logger.error("breeze-connect package not installed. Install with: pip install breeze-connect")
@@ -66,6 +87,135 @@ class DataProvider:
         except Exception as e:
             self.logger.error(f"Failed to initialize Breeze API: {str(e)}")
             raise
+    
+    def _is_session_valid(self) -> bool:
+        """Check if the current session is valid and not expired."""
+        if not self._session_token or not self._session_expiry:
+            return False
+            
+        # Consider session expired if within 5 minutes of expiry
+        buffer = timedelta(minutes=5)
+        return datetime.now(pytz.utc) < (self._session_expiry - buffer)
+    
+    def _renew_session(self) -> None:
+        """Renew the Breeze API session token."""
+        if not self._session_token or not self._api_secret:
+            self.logger.error("Cannot renew session: Missing session token or API secret")
+            return
+            
+        try:
+            self.logger.info("Renewing Breeze API session...")
+            self.breeze.generate_session(
+                api_secret=self._api_secret,
+                session_token=self._session_token
+            )
+            
+            # Update session expiry (Breeze sessions typically last 24 hours)
+            self._session_expiry = datetime.now(pytz.utc) + timedelta(hours=23, minutes=55)
+            self.logger.info(f"Session renewed successfully. Expires at {self._session_expiry.astimezone(self.ist_tz)}")
+            
+            # Reconnect WebSocket if needed
+            if hasattr(self.breeze, 'ws_connect'):
+                try:
+                    self.breeze.ws_connect()
+                except Exception as e:
+                    self.logger.warning(f"Failed to reconnect WebSocket: {str(e)}")
+                    
+        except Exception as e:
+            self.logger.error(f"Failed to renew session: {str(e)}")
+            raise SessionExpiredError("Failed to renew Breeze API session") from e
+    
+    def _ensure_valid_session(self) -> None:
+        """Ensure we have a valid session, renewing if necessary."""
+        if not self._is_session_valid():
+            self._renew_session()
+    
+    def _api_call_with_retry(self, func: Callable[..., T], *args, **kwargs) -> T:
+        """Execute an API call with retry logic and session management.
+        
+        Args:
+            func: The API function to call
+            *args: Positional arguments to pass to the function
+            **kwargs: Keyword arguments to pass to the function
+            
+        Returns:
+            The result of the API call
+            
+        Raises:
+            APIError: If the API call fails after all retries
+            SessionExpiredError: If session renewal fails
+        """
+        last_exception = None
+        
+        for attempt in range(self._max_retries):
+            try:
+                # Ensure we have a valid session before each attempt
+                self._ensure_valid_session()
+                
+                # Make the API call
+                result = func(*args, **kwargs)
+                self._last_api_call = datetime.now(pytz.utc)
+                
+                # Check for API errors in the response
+                if isinstance(result, dict) and 'Status' in result and result['Status'] != 200:
+                    error_msg = result.get('error', 'Unknown API error')
+                    
+                    # If session expired, try to renew and retry
+                    if 'session expired' in str(error_msg).lower():
+                        self.logger.warning("Session expired, attempting to renew...")
+                        self._renew_session()
+                        continue
+                        
+                    raise APIError(f"API error: {error_msg}")
+                
+                return result
+                
+            except Exception as e:
+                last_exception = e
+                self.logger.warning(f"API call attempt {attempt + 1} failed: {str(e)}")
+                
+                # Calculate backoff with jitter
+                backoff = min(
+                    self._initial_backoff * (2 ** attempt) + random.uniform(0, 1),
+                    self._max_backoff
+                )
+                
+                # Don't sleep on the last attempt
+                if attempt < self._max_retries - 1:
+                    self.logger.info(f"Retrying in {backoff:.2f} seconds...")
+                    time.sleep(backoff)
+        
+        # If we get here, all retries failed
+        self.logger.error(f"API call failed after {self._max_retries} attempts")
+        if isinstance(last_exception, APIError):
+            raise last_exception
+        raise APIError(f"API call failed: {str(last_exception)}") from last_exception
+    
+    def _get_historical_data_impl(
+        self,
+        symbol: str,
+        from_date: datetime,
+        to_date: datetime,
+        interval: str = '1minute',
+        exchange_code: str = 'NSE',
+        product_type: str = 'cash'
+    ) -> Dict:
+        """Internal implementation of get_historical_data without retry logic."""
+        if not self.breeze:
+            raise APIError("Breeze API not initialized")
+            
+        # Format dates as strings in the required format
+        from_str = from_date.strftime('%Y-%m-%dT%H:%M:%S')
+        to_str = to_date.strftime('%Y-%m-%dT%H:%M:%S')
+        
+        return self.breeze.get_historical_data(
+            interval=interval,
+            from_date=from_str,
+            to_date=to_str,
+            stock_code=symbol,
+            exchange_code=exchange_code,
+            product_type=product_type
+        )
     
     def get_historical_data(
         self,
@@ -76,7 +226,7 @@ class DataProvider:
         exchange_code: str = 'NSE',
         product_type: str = 'cash'
     ) -> pd.DataFrame:
-        """Fetch historical OHLCV data.
+        """Fetch historical OHLCV data with retry and session management.
         
         Args:
             symbol: Trading symbol (e.g., 'NIFTY', 'RELIANCE')
@@ -178,13 +328,39 @@ class DataProvider:
             self.logger.error(f"Error fetching historical data: {str(e)}")
             return pd.DataFrame()
     
+    def _get_option_chain_impl(
+        self,
+        expiry_date: datetime,
+        symbol: str = 'NIFTY',
+        exchange_code: str = 'NFO'
+    ) -> Dict:
+        """Internal implementation of get_option_chain without retry logic."""
+        if not self.breeze:
+            raise APIError("Breeze API not initialized")
+            
+        # Format expiry date as 'dd-MMM-YYYY'
+        expiry_str = expiry_date.strftime('%d-%b-%Y').upper()
+        
+        # Get option chain from Breeze API
+        chain = self.breeze.get_option_chain_quotes(
+            exchange_code=exchange_code,
+            stock_code=symbol,
+            product_type='options',
+            expiry_date=expiry_str
+        )
+        
+        if not chain or 'Success' not in chain:
+            raise APIError(f"Failed to fetch option chain for {symbol} {expiry_str}")
+        
+        return chain
+
     def get_option_chain(
         self,
         expiry_date: datetime,
         symbol: str = 'NIFTY',
         exchange_code: str = 'NFO'
     ) -> pd.DataFrame:
-        """Fetch option chain for the given expiry date.
+        """Fetch option chain for the given expiry date with retry and session management.
         
         Args:
             expiry_date: Expiry date of the options
@@ -195,24 +371,13 @@ class DataProvider:
             DataFrame with option chain data
         """
         try:
-            if not self.breeze:
-                self.logger.error("Breeze API not initialized")
-                return pd.DataFrame()
-            
-            # Format expiry date as 'dd-MMM-YYYY'
-            expiry_str = expiry_date.strftime('%d-%b-%Y').upper()
-            
-            # Get option chain
-            chain = self.breeze.get_option_chain_quotes(
-                stock_code=symbol,
-                exchange_code=exchange_code,
-                product_type="options",
-                expiry_date=expiry_str
+            # Call with retry and session management
+            chain = self._api_call_with_retry(
+                self._get_option_chain_impl,
+                expiry_date=expiry_date,
+                symbol=symbol,
+                exchange_code=exchange_code
             )
-            
-            if not chain or 'Success' not in chain:
-                self.logger.error(f"Failed to fetch option chain: {chain}")
-                return pd.DataFrame()
             
             # Convert to DataFrame
             df = pd.DataFrame(chain['Success'])
@@ -222,14 +387,49 @@ class DataProvider:
             df['type'] = df['option_type'].str.upper()
             
             # Filter for standard expiry (last Thursday of the month)
+            expiry_str = expiry_date.strftime('%d-%b-%Y').upper()
             df = df[df['expiry_date'] == expiry_str]
             
             return df
             
+        except APIError as e:
+            self.logger.error(f"API error in get_option_chain: {str(e)}")
         except Exception as e:
-            self.logger.error(f"Error fetching option chain: {str(e)}")
-            return pd.DataFrame()
+            self.logger.error(f"Error in get_option_chain: {str(e)}")
+        
+        return pd.DataFrame()
     
+    def _get_instrument_quotes_impl(
+        self,
+        exchange_code: str,
+        stock_code: str,
+        product_type: str = 'cash',
+        expiry_date: str = '',
+        strike_price: str = '',
+        right: str = '',
+        get_exchange_quotes: bool = False,
+        get_market_depth: bool = False
+    ) -> Dict:
+        """Internal implementation of get_instrument_quotes without retry logic."""
+        if not self.breeze:
+            raise APIError("Breeze API not initialized")
+            
+        quotes = self.breeze.get_quotes(
+            stock_code=stock_code,
+            exchange_code=exchange_code,
+            product_type=product_type,
+            expiry_date=expiry_date,
+            strike_price=strike_price,
+            right=right,
+            get_exchange_quotes=get_exchange_quotes,
+            get_market_depth=get_market_depth
+        )
+        
+        if not quotes or 'Success' not in quotes:
+            raise APIError(f"Failed to get quotes for {stock_code}")
+            
+        return quotes
+
     def get_instrument_quotes(
         self,
         exchange_code: str,
@@ -241,15 +441,13 @@ class DataProvider:
         get_exchange_quotes: bool = False,
         get_market_depth: bool = False
     ) -> Dict:
-        """Get quotes for a specific instrument."""
+        """Get quotes for a specific instrument with retry and session management."""
         try:
-            if not self.breeze:
-                self.logger.error("Breeze API not initialized")
-                return {}
-                
-            quotes = self.breeze.get_quotes(
-                stock_code=stock_code,
+            # Call with retry and session management
+            quotes = self._api_call_with_retry(
+                self._get_instrument_quotes_impl,
                 exchange_code=exchange_code,
+                stock_code=stock_code,
                 product_type=product_type,
                 expiry_date=expiry_date,
                 strike_price=strike_price,
@@ -258,11 +456,14 @@ class DataProvider:
                 get_market_depth=get_market_depth
             )
             
-            return quotes.get('Success', {}) if quotes else {}
+            return quotes.get('Success', {})
             
+        except APIError as e:
+            self.logger.error(f"API error in get_instrument_quotes: {str(e)}")
         except Exception as e:
-            self.logger.error(f"Error getting instrument quotes: {str(e)}")
-            return {}
+            self.logger.error(f"Error in get_instrument_quotes: {str(e)}")
+        
+        return {}
     
     def get_option_instrument(
         self,
@@ -271,11 +472,12 @@ class DataProvider:
         option_type: str,
         expiry_date: datetime
     ) -> Dict:
-        """Get instrument details for an option contract."""
+        """Get instrument details for an option contract with retry and session management."""
         try:
-            # Get option chain for the expiry date
+            # Get option chain for the expiry date (this already has retry logic)
             chain = self.get_option_chain(expiry_date, symbol)
             if chain.empty:
+                self.logger.warning(f"No option chain found for {symbol} {expiry_date}")
                 return {}
             
             # Find matching option
@@ -286,7 +488,7 @@ class DataProvider:
             ]
             
             if matching.empty:
-                self.logger.warning(f"No matching option found: {symbol} {strike} {option_type} {expiry_date}")
+                self.logger.warning(f"No matching option found: {symbol} {strike} {option_type}")
                 return {}
             
             # Get the first match (should be only one)
@@ -303,67 +505,88 @@ class DataProvider:
             }
             
         except Exception as e:
-            self.logger.error(f"Error getting option instrument: {str(e)}")
+            self.logger.error(f"Error in get_option_instrument: {str(e)}")
             return {}
     
-    def subscribe_feeds(self, instruments: List[Dict], callback) -> None:
-        """Subscribe to real-time market data feeds.
+    def _subscribe_feeds_impl(self, instruments: List[Dict]) -> None:
+        """Internal implementation of subscribe_feeds without retry logic."""
+        if not self.breeze:
+            raise APIError("Breeze API not initialized")
+            
+        # Unsubscribe from all previous subscriptions
+        self.breeze.unsubscribe_feeds()
+        
+        # Subscribe to new instruments
+        for inst in instruments:
+            self.breeze.subscribe_feeds(
+                stock_code=inst['stock_code'],
+                exchange_code=inst['exchange_code'],
+                product_type=inst.get('product_type', 'cash'),
+                expiry_date=inst.get('expiry_date', ''),
+                strike_price=inst.get('strike_price', ''),
+                right=inst.get('right', ''),
+                get_exchange_quotes=inst.get('get_exchange_quotes', True),
+                get_market_depth=inst.get('get_market_depth', False)
+            )
+
+    def subscribe_feeds(self, instruments: List[Dict], callback: Callable) -> None:
+        """Subscribe to real-time market data feeds with retry and session management.
         
         Args:
             instruments: List of instrument dictionaries with exchange_code and stock_code
             callback: Function to call when data is received
         """
-        if not self.breeze:
-            self.logger.error("Breeze API not initialized")
-            return
-            
         try:
-            # Unsubscribe from all previous subscriptions
-            self.breeze.unsubscribe_feeds()
-            
-            # Subscribe to new instruments
-            for inst in instruments:
-                self.breeze.subscribe_feeds(
-                    stock_code=inst['stock_code'],
-                    exchange_code=inst['exchange_code'],
-                    product_type=inst.get('product_type', 'cash'),
-                    expiry_date=inst.get('expiry_date', ''),
-                    strike_price=inst.get('strike_price', ''),
-                    right=inst.get('right', ''),
-                    get_exchange_quotes=inst.get('get_exchange_quotes', True),
-                    get_market_depth=inst.get('get_market_depth', False)
-                )
+            # Call with retry and session management
+            self._api_call_with_retry(
+                self._subscribe_feeds_impl,
+                instruments=instruments
+            )
             
             # Set the callback function
             self.breeze.on_ticks = callback
             
+        except APIError as e:
+            self.logger.error(f"API error in subscribe_feeds: {str(e)}")
         except Exception as e:
-            self.logger.error(f"Error subscribing to feeds: {str(e)}")
+            self.logger.error(f"Error in subscribe_feeds: {str(e)}")
     
+    def _get_latest_price_impl(self, symbol: str, exchange_code: str = 'NSE') -> Dict:
+        """Internal implementation of get_latest_price without retry logic."""
+        if not self.breeze:
+            raise APIError("Breeze API not initialized")
+            
+        quotes = self.breeze.get_quotes(
+            stock_code=symbol,
+            exchange_code=exchange_code,
+            product_type='cash',
+            expiry_date='',
+            right='',
+            strike_price='0',
+            get_exchange_quotes=True,
+            get_market_depth=False
+        )
+        
+        if not quotes or 'Success' not in quotes:
+            raise APIError(f"Failed to get latest price for {symbol}")
+            
+        return quotes
+
     def get_latest_price(self, symbol: str, exchange_code: str = 'NSE') -> float:
-        """Get the latest price for a symbol."""
+        """Get the latest price for a symbol with retry and session management."""
         try:
-            if not self.breeze:
-                self.logger.error("Breeze API not initialized")
-                return 0.0
-                
-            quotes = self.breeze.get_quotes(
-                stock_code=symbol,
-                exchange_code=exchange_code,
-                product_type='cash',
-                expiry_date='',
-                right='',
-                strike_price='0',
-                get_exchange_quotes=True,
-                get_market_depth=False
+            # Call with retry and session management
+            quotes = self._api_call_with_retry(
+                self._get_latest_price_impl,
+                symbol=symbol,
+                exchange_code=exchange_code
             )
             
-            if not quotes or 'Success' not in quotes:
-                self.logger.error(f"Failed to get latest price for {symbol}")
-                return 0.0
-                
             return float(quotes['Success']['ltp'])
             
+        except APIError as e:
+            self.logger.error(f"API error in get_latest_price: {str(e)}")
         except Exception as e:
-            self.logger.error(f"Error getting latest price: {str(e)}")
-            return 0.0
+            self.logger.error(f"Error in get_latest_price: {str(e)}")
+        
+        return 0.0

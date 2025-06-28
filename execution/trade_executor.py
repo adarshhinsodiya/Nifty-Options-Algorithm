@@ -85,7 +85,8 @@ class TradeExecutor:
         stop_loss: float = 0.0,
         trailing_stop_loss: float = 0.0,
         target_price: float = 0.0,
-        tag: str = ''
+        tag: str = '',
+        signal: Optional[TradeSignal] = None
     ) -> Optional[Order]:
         """Place an order.
         
@@ -101,6 +102,7 @@ class TradeExecutor:
             trailing_stop_loss: Trailing stop loss amount
             target_price: Target price for bracket orders
             tag: Optional order tag for tracking
+            signal: Optional TradeSignal object for options orders
             
         Returns:
             Order object if successful, None otherwise
@@ -132,24 +134,43 @@ class TradeExecutor:
                     self.logger.warning("Order not placed: Market is closed")
                     return None
                 
+                # Prepare order parameters
+                order_params = {
+                    'stock_code': symbol,
+                    'exchange_code': exchange_code,
+                    'product': product,
+                    'action': 'buy' if quantity > 0 else 'sell',
+                    'order_type': order_type.value.lower(),
+                    'stoploss': stop_loss,
+                    'quantity': abs(quantity),
+                    'price': price,
+                    'validity': validity,
+                    'disclosed_quantity': 0,
+                    'trader_id': '',
+                    'tag': tag
+                }
+                
+                # Add option-specific parameters if this is an options order
+                if product.lower() == 'options':
+                    if not signal:
+                        self.logger.error("Signal object is required for options orders")
+                        return None
+                        
+                    if not signal.expiry_date:
+                        self.logger.error("expiry_date is required for options orders")
+                        return None
+                        
+                    # Format expiry date as 'DD-MM-YYYY' for Breeze API
+                    expiry_date = signal.expiry_date.strftime('%d-%m-%Y')
+                    
+                    order_params.update({
+                        'expiry_date': expiry_date,
+                        'right': signal.option_type.upper(),  # CE or PE
+                        'strike_price': signal.strike
+                    })
+                
                 # Place order via Breeze API
-                response = self.data_provider.breeze.place_order(
-                    stock_code=symbol,
-                    exchange_code=exchange_code,
-                    product=product,
-                    action='buy' if quantity > 0 else 'sell',
-                    order_type=order_type.value.lower(),
-                    stoploss=stop_loss,
-                    quantity=abs(quantity),
-                    price=price,
-                    validity=validity,
-                    disclosed_quantity=0,
-                    expiry_date='',
-                    right='',
-                    strike_price=0,
-                    trader_id='',
-                    tag=tag
-                )
+                response = self.data_provider.breeze.place_order(**order_params)
                 
                 if not response or 'Success' not in response:
                     self.logger.error(f"Order placement failed: {response}")
@@ -162,7 +183,7 @@ class TradeExecutor:
                 
                 # For bracket orders, place SL and target orders
                 if stop_loss > 0 or target_price > 0:
-                    self._place_bracket_orders(order, stop_loss, target_price)
+                    self._place_bracket_orders(order, stop_loss, target_price, signal)
             
             # In backtest mode, simulate order execution
             else:
@@ -191,10 +212,36 @@ class TradeExecutor:
         self,
         main_order: Order,
         stop_loss: float,
-        target_price: float
+        target_price: float,
+        signal: Optional[TradeSignal] = None
     ) -> None:
-        """Place bracket orders (SL and target) for the main order."""
+        """Place bracket orders (SL and target) for the main order.
+        
+        Args:
+            main_order: The main order to place brackets for
+            stop_loss: Stop loss price
+            target_price: Target price
+            signal: Optional TradeSignal object for options orders
+        """
         try:
+            # Common order parameters
+            order_params = {
+                'exchange_code': 'NFO',
+                'product': 'options',
+                'quantity': abs(main_order.quantity),
+                'validity': 'day',
+                'disclosed_quantity': 0,
+                'trader_id': ''
+            }
+            
+            # Add option-specific parameters if signal is provided
+            if signal and signal.expiry_date:
+                order_params.update({
+                    'expiry_date': signal.expiry_date.strftime('%d-%m-%Y'),
+                    'right': signal.option_type.upper(),
+                    'strike_price': signal.strike
+                })
+            
             if stop_loss > 0:
                 # Place stop loss order
                 sl_order_id = f"{main_order.order_id}_SL"
@@ -210,27 +257,23 @@ class TradeExecutor:
                 
                 # In live mode, place actual SL order
                 if self.data_provider.mode == 'live':
-                    sl_response = self.data_provider.breeze.place_order(
-                        stock_code=main_order.symbol,
-                        exchange_code='NFO',
-                        product='options',
-                        action='sell' if main_order.quantity > 0 else 'buy',
-                        order_type='stoploss',
-                        stoploss=stop_loss,
-                        quantity=abs(main_order.quantity),
-                        price=0,
-                        validity='day',
-                        disclosed_quantity=0,
-                        expiry_date='',
-                        right='',
-                        strike_price=0,
-                        trader_id='',
-                        tag=f"SL_{main_order.order_id}"
-                    )
+                    sl_params = order_params.copy()
+                    sl_params.update({
+                        'stock_code': main_order.symbol,
+                        'action': 'sell' if main_order.quantity > 0 else 'buy',
+                        'order_type': 'stoploss',
+                        'stoploss': stop_loss,
+                        'price': 0,  # Market order for SL
+                        'tag': f"SL_{main_order.order_id}"
+                    })
+                    
+                    sl_response = self.data_provider.breeze.place_order(**sl_params)
                     
                     if sl_response and 'Success' in sl_response:
                         sl_order.exchange_order_id = sl_response['Success']['order_id']
                         sl_order.status = OrderStatus.OPEN
+                    else:
+                        self.logger.error(f"Failed to place SL order: {sl_response}")
                 
                 self.orders[sl_order_id] = sl_order
                 
@@ -249,27 +292,23 @@ class TradeExecutor:
                 
                 # In live mode, place actual target order
                 if self.data_provider.mode == 'live':
-                    tgt_response = self.data_provider.breeze.place_order(
-                        stock_code=main_order.symbol,
-                        exchange_code='NFO',
-                        product='options',
-                        action='sell' if main_order.quantity > 0 else 'buy',
-                        order_type='limit',
-                        stoploss=0,
-                        quantity=abs(main_order.quantity),
-                        price=target_price,
-                        validity='day',
-                        disclosed_quantity=0,
-                        expiry_date='',
-                        right='',
-                        strike_price=0,
-                        trader_id='',
-                        tag=f"TGT_{main_order.order_id}"
-                    )
+                    tgt_params = order_params.copy()
+                    tgt_params.update({
+                        'stock_code': main_order.symbol,
+                        'action': 'sell' if main_order.quantity > 0 else 'buy',
+                        'order_type': 'limit',
+                        'stoploss': 0,
+                        'price': target_price,
+                        'tag': f"TGT_{main_order.order_id}"
+                    })
+                    
+                    tgt_response = self.data_provider.breeze.place_order(**tgt_params)
                     
                     if tgt_response and 'Success' in tgt_response:
                         tgt_order.exchange_order_id = tgt_response['Success']['order_id']
                         tgt_order.status = OrderStatus.OPEN
+                    else:
+                        self.logger.error(f"Failed to place target order: {tgt_response}")
                 
                 self.orders[tgt_order_id] = tgt_order
                 
@@ -326,9 +365,13 @@ class TradeExecutor:
                 symbol=option['stock_code'],
                 order_type=OrderType.MARKET,
                 quantity=quantity,
+                price=0,  # Market order
                 product='options',
                 exchange_code='NFO',
-                tag=f"ENTRY_{signal.signal_type.value}_{datetime.now(self.ist_tz).strftime('%H%M%S')}"
+                stop_loss=signal.stop_loss,
+                target_price=signal.take_profit,
+                tag=f"ENTRY_{signal.signal_type.value}_{datetime.now(self.ist_tz).strftime('%H%M%S')}",
+                signal=signal  # Pass the signal for options parameters
             )
             
             if not order or order.status != OrderStatus.COMPLETE:
