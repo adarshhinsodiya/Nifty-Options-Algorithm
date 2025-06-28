@@ -241,11 +241,21 @@ class TradeExecutor:
                         'strike_price': signal.strike
                     })
                 
-                # Place order via Breeze API
-                response = self.data_provider.breeze.place_order(**order_params)
-                
-                if not response or 'Success' not in response:
-                    self.logger.error(f"Order placement failed: {response}")
+                # Place order via Breeze API with retry/backoff
+                try:
+                    # Use the data provider's retry mechanism for the API call
+                    response = self.data_provider._api_call_with_retry(
+                        self.data_provider.breeze.place_order,
+                        **order_params
+                    )
+                    
+                    if not response or 'Success' not in response:
+                        self.logger.error(f"Order placement failed: {response}")
+                        order.status = OrderStatus.REJECTED
+                        return None
+                        
+                except Exception as e:
+                    self.logger.error(f"Failed to place order after retries: {str(e)}")
                     order.status = OrderStatus.REJECTED
                     return None
                 
