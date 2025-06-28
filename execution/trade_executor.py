@@ -35,6 +35,10 @@ class TradeExecutor:
         self.orders: Dict[str, Order] = {}
         self.positions: Dict[str, Position] = {}
         self.last_trade_time = None
+        
+        # Trade and position tracking
+        self.current_date = datetime.now(self.ist_tz).date()
+        self.daily_trades_count = 0
     
     def _setup_logger(self) -> logging.Logger:
         """Set up logger for the trade executor."""
@@ -393,6 +397,50 @@ class TradeExecutor:
         except Exception as e:
             self.logger.error(f"Error placing bracket orders: {str(e)}")
     
+    def _check_daily_trades_limit(self) -> bool:
+        """Check if we've reached the maximum number of daily trades.
+        
+        Returns:
+            bool: True if we can place more trades today, False otherwise
+        """
+        current_date = datetime.now(self.ist_tz).date()
+        
+        # Reset daily counter if it's a new day
+        if current_date != self.current_date:
+            self.current_date = current_date
+            self.daily_trades_count = 0
+            self.logger.debug(f"New trading day: {self.current_date}")
+        
+        # Check against max daily trades limit
+        max_daily = self.trading_config.max_daily_trades
+        if max_daily > 0 and self.daily_trades_count >= max_daily:
+            self.logger.warning(
+                f"Daily trade limit reached: {self.daily_trades_count}/{max_daily} "
+                "trades used today"
+            )
+            return False
+            
+        return True
+    
+    def _check_max_positions(self) -> bool:
+        """Check if we can open a new position based on max_open_positions.
+        
+        Returns:
+            bool: True if we can open a new position, False otherwise
+        """
+        max_positions = self.trading_config.max_open_positions
+        if max_positions <= 0:  # No limit if zero or negative
+            return True
+            
+        current_positions = len(self.portfolio.get_open_positions())
+        if current_positions >= max_positions:
+            self.logger.warning(
+                f"Maximum open positions limit reached: {current_positions}/{max_positions}"
+            )
+            return False
+            
+        return True
+    
     def execute_signal(self, signal: TradeSignal) -> Optional[Position]:
         """Execute a trading signal.
         
@@ -403,6 +451,14 @@ class TradeExecutor:
             Position object if successful, None otherwise
         """
         try:
+            # Check position limits
+            if not self._check_max_positions():
+                return None
+                
+            # Check daily trade limits
+            if not self._check_daily_trades_limit():
+                return None
+                
             # Check if we already have an open position for this signal
             for position in self.portfolio.get_open_positions():
                 if (
@@ -465,6 +521,10 @@ class TradeExecutor:
                 tag=f"ENTRY_{signal.signal_type.value}_{datetime.now(self.ist_tz).strftime('%H%M%S')}",
                 signal=signal  # Pass the signal for options parameters
             )
+            
+            # Increment daily trade counter if order was placed successfully
+            if order and order.status == OrderStatus.COMPLETE:
+                self.daily_trades_count += 1
             
             if not order or order.status != OrderStatus.COMPLETE:
                 self.logger.error(f"Failed to place entry order for {signal}")
