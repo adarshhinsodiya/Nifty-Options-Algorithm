@@ -29,6 +29,7 @@ class TradeExecutor:
         self.portfolio = portfolio
         self.trading_config = config.get_trading_config()
         self.options_config = config.get_options_config()
+        self.backtest_config = config.get_backtest_config()
         self.ist_tz = pytz.timezone('Asia/Kolkata')
         self.logger = self._setup_logger()
         self.orders: Dict[str, Order] = {}
@@ -39,6 +40,68 @@ class TradeExecutor:
         """Set up logger for the trade executor."""
         logger = logging.getLogger(__name__)
         return logger
+        
+    def _calculate_fill_price(
+        self,
+        symbol: str,
+        order_type: OrderType,
+        price: float,
+        quantity: int,
+        is_options: bool = False
+    ) -> float:
+        """Calculate fill price with slippage and spread for backtesting.
+        
+        Args:
+            symbol: Trading symbol
+            order_type: Type of order (MARKET, LIMIT, etc.)
+            price: Requested price (0 for market orders)
+            quantity: Order quantity (positive for buy, negative for sell)
+            is_options: Whether this is an options trade
+            
+        Returns:
+            float: Fill price with slippage and spread applied
+        """
+        try:
+            # Get current market data
+            current_price = self.data_provider.get_latest_price(symbol, 'NFO' if is_options else 'NSE')
+            
+            # For market orders, use the current market price
+            if order_type == OrderType.MARKET:
+                fill_price = current_price
+            else:
+                # For limit/sl orders, use the requested price if it's better than the current price
+                if (quantity > 0 and price >= current_price) or (quantity < 0 and price <= current_price):
+                    fill_price = price
+                else:
+                    fill_price = current_price
+            
+            # Apply spread (bid-ask spread simulation)
+            # For options, use a wider spread (0.5% each side)
+            # For stocks, use a tighter spread (0.1% each side)
+            spread_pct = 0.005 if is_options else 0.001
+            
+            if quantity > 0:  # Buy order - pay the ask price (higher)
+                fill_price *= (1 + spread_pct)
+            else:  # Sell order - get the bid price (lower)
+                fill_price *= (1 - spread_pct)
+            
+            # Apply slippage (random between 0 and slippage config, in basis points)
+            slippage_bps = self.backtest_config.slippage  # Slippage in basis points (e.g., 5 = 0.05%)
+            if slippage_bps > 0:
+                slippage_pct = (random.uniform(0, slippage_bps) / 10000)  # Convert bps to decimal
+                fill_price *= (1 + slippage_pct) if quantity > 0 else (1 - slippage_pct)
+            
+            # Ensure price is valid and non-negative
+            fill_price = max(0.05, fill_price)  # Minimum price of 0.05 to avoid negative or zero prices
+            
+            # Round to appropriate decimal places
+            fill_price = round(fill_price, 2 if is_options else 2)  # 2 decimal places for both stocks and options
+            
+            return fill_price
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating fill price: {str(e)}")
+            return price  # Fallback to requested price if there's an error
     
     def _generate_order_id(self) -> str:
         """Generate a unique order ID."""
@@ -185,13 +248,28 @@ class TradeExecutor:
                 if stop_loss > 0 or target_price > 0:
                     self._place_bracket_orders(order, stop_loss, target_price, signal)
             
-            # In backtest mode, simulate order execution
+            # In backtest mode, simulate order execution with slippage and spread
             else:
-                # Simulate immediate fill at the requested price
+                # Calculate fill price with slippage and spread
+                fill_price = self._calculate_fill_price(
+                    symbol=symbol,
+                    order_type=order_type,
+                    price=price,
+                    quantity=quantity,
+                    is_options=(product.lower() == 'options')
+                )
+                
+                # Simulate immediate fill at the calculated price
                 order.status = OrderStatus.COMPLETE
                 order.filled_quantity = quantity
-                order.average_price = price
+                order.average_price = fill_price
                 order.filled_timestamp = datetime.now(self.ist_tz)
+                
+                self.logger.debug(
+                    f"Backtest fill - Requested: {price:.2f}, "
+                    f"Filled: {fill_price:.2f}, "
+                    f"Slippage: {abs(fill_price - price):.2f}"
+                )
             
             # Store the order
             self.orders[order_id] = order
