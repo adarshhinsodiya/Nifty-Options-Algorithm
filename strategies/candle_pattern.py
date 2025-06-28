@@ -209,8 +209,10 @@ class CandlePatternStrategy:
         
         # Generate signals
         for i in range(1, len(df)):
-            signal_type, _ = self.analyze_candle_pattern(df, i)
-            if signal_type:
+            signal_type, signal = self.analyze_candle_pattern(df, i)
+            if signal_type and signal:
                 df.at[df.index[i], 'signal'] = signal_type
+                # Store the full signal object for later use
+                df.at[df.index[i], '_signal_obj'] = signal
         
         return df

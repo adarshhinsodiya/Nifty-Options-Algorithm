@@ -137,20 +137,17 @@ class TradingOrchestrator:
             
             # Check for new signals
             if pd.notna(current['signal']):
-                signal_type = current['signal']
-                
-                # Create trade signal
-                signal = TradeSignal(
-                    signal_type=TradeSignalType(signal_type),
-                    entry_price=current['close'],
-                    stop_loss=0,  # Will be set by strategy
-                    take_profit=0,  # Will be set by strategy
-                    strike=0,  # Will be set by strategy
-                    option_type='ce' if signal_type == 'LONG' else 'pe',
-                    timestamp=current.name,
-                    spot_price=current['close'],
-                    expiry_date=self._get_next_expiry(current.name)
-                )
+                # Get the fully enriched signal from the DataFrame
+                if '_signal_obj' in current and current['_signal_obj'] is not None:
+                    signal = current['_signal_obj']
+                    self.logger.debug(f"Executing signal from DataFrame: {signal}")
+                else:
+                    # Fallback to generating the signal if not found in DataFrame
+                    self.logger.warning("Signal object not found in DataFrame, falling back to analysis")
+                    signal_type, signal = self.strategy.analyze_candle_pattern(df, i)
+                    if not signal:
+                        self.logger.warning("Strategy returned no signal despite signal flag")
+                        continue
                 
                 # Execute the signal
                 self.trade_executor.execute_signal(signal)
@@ -277,23 +274,14 @@ class TradingOrchestrator:
         
         # Check for new signals
         if not df.empty and 'signal' in df.columns and pd.notna(df.iloc[-1]['signal']):
-            signal_type = df.iloc[-1]['signal']
+            # Get the fully enriched signal from the strategy
+            signal_type, signal = self.strategy.analyze_candle_pattern(df, len(df) - 1)
             
-            # Create trade signal
-            signal = TradeSignal(
-                signal_type=TradeSignalType(signal_type),
-                entry_price=candle['close'],
-                stop_loss=0,  # Will be set by strategy
-                take_profit=0,  # Will be set by strategy
-                strike=0,  # Will be set by strategy
-                option_type='ce' if signal_type == 'LONG' else 'pe',
-                timestamp=datetime.now(self.ist_tz),
-                spot_price=candle['close'],
-                expiry_date=self._get_next_expiry(datetime.now(self.ist_tz))
-            )
-            
-            self.last_candle_time = candle['datetime']
-            return signal
+            if signal:
+                self.last_candle_time = candle['datetime']
+                return signal
+            else:
+                self.logger.warning("Strategy returned no signal despite signal flag")
             
         return None
     
