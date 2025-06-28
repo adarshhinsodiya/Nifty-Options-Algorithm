@@ -14,6 +14,8 @@ from pathlib import Path
 
 from core.config_manager import ConfigManager
 from core.models import Portfolio, Position, TradeSignal, TradeSignalType
+from core.signal_monitor import SignalMonitor
+from core.exceptions import MaxRetriesExceededError, TradingError
 from data.data_provider import DataProvider
 from execution.trade_executor import TradeExecutor
 from strategies.candle_pattern import CandlePatternStrategy
@@ -45,15 +47,33 @@ class TradingOrchestrator:
         self.trade_executor = TradeExecutor(self.config, self.data_provider, self.portfolio)
         self.strategy = CandlePatternStrategy(self.config)
         
+        # Initialize signal monitor with trade executor and data provider
+        self.signal_monitor = SignalMonitor(
+            config=self.config,
+            trade_executor=self.trade_executor,
+            data_provider=self.data_provider if self.mode == 'live' else None
+        )
+        
         # State tracking
         self.running = False
         self.last_candle_time = None
         self.current_date = None
+        self.market_open = False
         
         # Tick data aggregation
         self.current_minute = None
         self.current_candle = None
         self.ticks_buffer = []
+        
+        # Performance metrics
+        self.metrics = {
+            'signals_processed': 0,
+            'signals_failed': 0,
+            'api_errors': 0,
+            'last_error': None,
+            'start_time': datetime.now(self.ist_tz),
+            'last_signal_time': None
+        }
     
     def _setup_logging(self) -> None:
         """Configure logging for the application."""
@@ -167,51 +187,83 @@ class TradingOrchestrator:
         self._generate_performance_report()
     
     def _run_live(self) -> None:
-        """Run live trading mode."""
-        self.logger.info("Starting live trading...")
+        """Run live trading mode with enhanced reliability and monitoring."""
+        self.logger.info("Starting live trading with enhanced signal monitoring...")
         
-        # Initialize real-time data subscription
-        self._setup_realtime_data()
-        
-        # Initialize tick data structures
-        self.current_minute = None
-        self.current_candle = None
-        self.ticks_buffer = []
-        
-        # Main trading loop
-        self.running = True
-        while self.running:
-            try:
-                current_time = datetime.now(self.ist_tz)
-                
-                # Check if market is open
-                if not self._is_market_hours():
-                    if self._is_market_closed():
-                        # Process any remaining ticks before closing
-                        if self.current_candle:
-                            self._process_completed_candle()
-                        # Square off all positions at EOD
-                        self.trade_executor.square_off_all_positions()
+        try:
+            # Initialize real-time data subscription
+            self._setup_realtime_data()
+            
+            # Initialize tick data structures
+            self.current_minute = None
+            self.current_candle = None
+            self.ticks_buffer = []
+            
+            # Start the signal monitor
+            self.signal_monitor.start()
+            
+            # Main trading loop
+            self.running = True
+            last_health_check = datetime.now(self.ist_tz)
+            
+            while self.running:
+                try:
+                    current_time = datetime.now(self.ist_tz)
+                    
+                    # Check if market is open
+                    market_open = self._is_market_hours()
+                    
+                    # Handle market state changes
+                    if market_open != self.market_open:
+                        if market_open:
+                            self._on_market_open()
+                        else:
+                            self._on_market_close()
+                        self.market_open = market_open
+                    
+                    # Check if market is closed for the day
+                    if not market_open and self._is_market_closed():
                         self.logger.info("Market closed. Shutting down...")
                         break
                     
-                    # Wait for market to open
-                    time.sleep(60)
-                    continue
-                
-                # Process any ticks that have been received
-                if self.ticks_buffer:
-                    # Process ticks in batches to avoid blocking
-                    ticks_to_process = self.ticks_buffer.copy()
-                    self.ticks_buffer = []
-                    self._process_ticks(ticks_to_process)
-                
-                # Sleep to avoid excessive CPU usage
-                time.sleep(0.1)  # 100ms sleep for better tick processing
-                
-            except Exception as e:
-                self.logger.error(f"Error in live trading loop: {str(e)}", exc_info=True)
-                time.sleep(5)  # Wait before retrying
+                    # Process any ticks that have been received
+                    if self.ticks_buffer:
+                        # Process ticks in batches to avoid blocking
+                        ticks_to_process = self.ticks_buffer.copy()
+                        self.ticks_buffer = []
+                        self._process_ticks(ticks_to_process)
+                    
+                    # Check for signals from strategy
+                    if market_open and self.current_candle:
+                        try:
+                            self._check_for_signals(self.current_candle)
+                        except Exception as e:
+                            self.metrics['signals_failed'] += 1
+                            self.metrics['last_error'] = str(e)
+                            self.logger.error(f"Error checking for signals: {str(e)}", exc_info=True)
+                    
+                    # Periodic health check
+                    if (current_time - last_health_check).total_seconds() >= 300:  # Every 5 minutes
+                        self._check_system_health()
+                        last_health_check = current_time
+                    
+                    # Sleep to avoid excessive CPU usage
+                    time.sleep(0.1)  # 100ms sleep for better tick processing
+                    
+                except KeyboardInterrupt:
+                    self.logger.info("Received keyboard interrupt, shutting down...")
+                    break
+                except Exception as e:
+                    self.metrics['api_errors'] += 1
+                    self.metrics['last_error'] = str(e)
+                    self.logger.error(f"Error in live trading loop: {str(e)}", exc_info=True)
+                    time.sleep(5)  # Wait before retrying
+                    
+        except Exception as e:
+            self.logger.critical(f"Fatal error in live trading: {str(e)}", exc_info=True)
+            raise
+        finally:
+            self._shutdown_live_trading()
     
     def _load_historical_data(
         self, 
@@ -326,17 +378,22 @@ class TradingOrchestrator:
         if not self.current_candle or 'close' not in self.current_candle:
             return
             
-        self.logger.debug(
-            f"Completed 1m candle: {self.current_candle['datetime']} | "
-            f"O:{self.current_candle['open']:.2f} H:{self.current_candle['high']:.2f} "
-            f"L:{self.current_candle['low']:.2f} C:{self.current_candle['close']:.2f} "
-            f"V:{self.current_candle['volume']}"
-        )
-        
-        # Check for signals based on the completed candle
-        signal = self._check_for_signals(self.current_candle)
-        if signal:
-            self.trade_executor.execute_signal(signal)
+        try:
+            # Log the completed candle
+            self.logger.debug(
+                f"Completed 1m candle: {self.current_candle['datetime']} | "
+                f"O:{self.current_candle['open']:.2f} H:{self.current_candle['high']:.2f} "
+                f"L:{self.current_candle['low']:.2f} C:{self.current_candle['close']:.2f} "
+                f"V:{self.current_candle['volume']}"
+            )
+            
+            # Check for signals based on the completed candle
+            self._check_for_signals(self.current_candle)
+            
+        except Exception as e:
+            self.metrics['signals_failed'] += 1
+            self.metrics['last_error'] = str(e)
+            self.logger.error(f"Error processing completed candle: {str(e)}", exc_info=True)
     
     def _on_tick(self, ticks: List[Dict[str, Any]]) -> None:
         """Handle incoming real-time ticks and aggregate into 1-minute candles.
@@ -393,33 +450,249 @@ class TradingOrchestrator:
             except Exception as e:
                 self.logger.error(f"Error processing tick {tick}: {str(e)}", exc_info=True)
     
-    def _check_for_signals(self, candle: Dict[str, Any]) -> Optional[TradeSignal]:
-        """Check for trading signals based on the latest candle."""
-        # Convert single candle to DataFrame for analysis
-        df = pd.DataFrame([candle])
+    def _on_market_open(self) -> None:
+        """Handle market open event."""
+        self.logger.info("Market is now open")
+        self._prepare_for_trading_day()
         
-        # Add previous candle for pattern recognition
-        if self.last_candle_time is not None and self.last_candle_time < candle['datetime']:
-            # Get previous candle from data provider or cache
-            prev_candle = self._get_previous_candle(candle['datetime'])
-            if prev_candle is not None:
-                df = pd.concat([pd.DataFrame([prev_candle]), df], ignore_index=True)
-        
-        # Generate signals
-        df = self.strategy.generate_signals(df)
-        
-        # Check for new signals
-        if not df.empty and 'signal' in df.columns and pd.notna(df.iloc[-1]['signal']):
-            # Get the fully enriched signal from the strategy
-            signal_type, signal = self.strategy.analyze_candle_pattern(df, len(df) - 1)
+        # Initialize signal history if it doesn't exist
+        if not hasattr(self, '_signal_history'):
+            self._signal_history = {}
             
-            if signal:
-                self.last_candle_time = candle['datetime']
-                return signal
-            else:
-                self.logger.warning("Strategy returned no signal despite signal flag")
+        # Reset daily metrics
+        self.metrics.update({
+            'signals_processed': 0,
+            'signals_failed': 0,
+            'api_errors': 0,
+            'last_error': None,
+            'last_signal_time': None
+        })
+        
+        # Clear any stale signal history
+        self._signal_history.clear()
+        
+        # Reset the signal monitor
+        if hasattr(self, 'signal_monitor'):
+            self.signal_monitor.reset()
+    
+    def _on_market_close(self) -> None:
+        """Handle market close event."""
+        self.logger.info("Market is now closed")
+        
+        # Process any remaining ticks
+        if self.ticks_buffer:
+            ticks_to_process = self.ticks_buffer.copy()
+            self.ticks_buffer = []
+            self._process_ticks(ticks_to_process)
+        
+        # Process the last candle
+        if self.current_candle:
+            self._process_completed_candle()
+        
+        # Close all positions at EOD
+        self.trade_executor.square_off_all_positions()
+        
+        # Log end of day metrics
+        self.logger.info(
+            f"End of day summary - Signals: {self.metrics['signals_processed']} processed, "
+            f"{self.metrics['signals_failed']} failed, "
+            f"API errors: {self.metrics['api_errors']}"
+        )
+    
+    def _check_system_health(self) -> Dict[str, Any]:
+        """Check system health and return status.
+        
+        Returns:
+            Dict containing system health status
+        """
+        status = {
+            'timestamp': datetime.now(self.ist_tz).isoformat(),
+            'market_status': 'open' if self.market_open else 'closed',
+            'signals_processed': self.metrics['signals_processed'],
+            'signals_failed': self.metrics['signals_failed'],
+            'api_errors': self.metrics['api_errors'],
+            'last_error': self.metrics['last_error'],
+            'uptime_minutes': round((datetime.now(self.ist_tz) - self.metrics['start_time']).total_seconds() / 60, 1),
+            'last_signal': self.metrics['last_signal_time'].isoformat() if self.metrics['last_signal_time'] else None,
+            'signal_queue_size': len(self.signal_monitor.get_queued_signals()) if hasattr(self, 'signal_monitor') else 0,
+            'active_symbols': list(set(s.symbol for s in self.signal_monitor.get_queued_signals())) if hasattr(self, 'signal_monitor') else []
+        }
+        
+        # Log health status
+        self.logger.info(f"System health check: {json.dumps(status, default=str)}")
+        
+        return status
+    
+    def _shutdown_live_trading(self) -> None:
+        """Gracefully shut down live trading."""
+        self.logger.info("Initiating graceful shutdown...")
+        
+        try:
+            # Stop the signal monitor
+            if hasattr(self, 'signal_monitor') and self.signal_monitor:
+                self.signal_monitor.shutdown()
             
-        return None
+            # Close any open positions if market is still open
+            if self.market_open:
+                self.logger.info("Closing all open positions...")
+                self.trade_executor.square_off_all_positions()
+            
+            # Log final metrics
+            self._check_system_health()
+            
+            self.logger.info("Shutdown complete")
+            
+        except Exception as e:
+            self.logger.error(f"Error during shutdown: {str(e)}", exc_info=True)
+        finally:
+            self.running = False
+    
+    def _check_for_signals(self, candle: Dict[str, Any]) -> None:
+        """Check for trading signals based on the latest candle and queue them for processing.
+        
+        This method handles signal generation, deduplication, prioritization, and queuing.
+        It ensures that only valid, non-duplicate signals are processed with proper error handling.
+        
+        Args:
+            candle: Latest candle data containing OHLCV information
+        """
+        if not candle or 'close' not in candle:
+            self.logger.warning("Invalid candle data received for signal generation")
+            return
+            
+        try:
+            # Convert single candle to DataFrame for analysis
+            df = pd.DataFrame([candle])
+            
+            # Add previous candle for better pattern recognition if available
+            if self.last_candle_time is not None and self.last_candle_time < candle['datetime']:
+                prev_candle = self._get_previous_candle(candle['datetime'])
+                if prev_candle is not None:
+                    df = pd.concat([pd.DataFrame([prev_candle]), df], ignore_index=True)
+            
+            # Generate signals from strategy
+            if not hasattr(self.strategy, 'generate_signals'):
+                self.logger.warning("Strategy does not implement generate_signals method")
+                return
+                
+            signals = self.strategy.generate_signals(df)
+            if not signals:
+                return
+                
+            # Process and queue each signal
+            for signal in signals:
+                if not signal or not isinstance(signal, TradeSignal):
+                    self.logger.warning(f"Invalid signal type received: {type(signal)}")
+                    continue
+                    
+                try:
+                    # Enrich signal with additional metadata
+                    signal.timestamp = datetime.now(self.ist_tz)
+                    signal.symbol = candle.get('symbol', signal.symbol)
+                    signal.price = candle.get('close', signal.price)
+                    
+                    # Set signal priority (higher number = higher priority)
+                    if signal.signal_type == TradeSignalType.EXIT:
+                        signal.priority = 3  # Exit signals get highest priority
+                    elif signal.signal_type == TradeSignalType.STOP_LOSS:
+                        signal.priority = 4  # Stop losses get highest priority
+                    elif signal.signal_type in [TradeSignalType.ENTRY_LONG, TradeSignalType.ENTRY_SHORT]:
+                        signal.priority = 2  # New entries get medium priority
+                    else:
+                        signal.priority = 1  # Other signals get lowest priority
+                    
+                    # Check if similar signal was recently processed
+                    if self._is_duplicate_signal(signal):
+                        self.logger.debug(f"Skipping duplicate signal: {signal}")
+                        continue
+                        
+                    # Queue the signal for processing
+                    if self.signal_monitor.queue_signal(signal):
+                        self.metrics['signals_processed'] += 1
+                        self.metrics['last_signal_time'] = signal.timestamp
+                        self.logger.info(f"Queued signal for processing: {signal}")
+                        
+                        # Update last processed signal timestamp for this symbol/type
+                        self._update_signal_history(signal)
+                    else:
+                        self.metrics['signals_failed'] += 1
+                        self.logger.warning(f"Failed to queue signal: {signal}")
+                        
+                except Exception as e:
+                    self.metrics['signals_failed'] += 1
+                    self.metrics['last_error'] = str(e)
+                    self.logger.error(f"Error processing signal {signal}: {str(e)}", exc_info=True)
+                    
+        except Exception as e:
+            self.metrics['signals_failed'] += 1
+            self.metrics['last_error'] = str(e)
+            self.logger.error(f"Error in signal generation: {str(e)}", exc_info=True)
+            
+    def _is_duplicate_signal(self, signal: TradeSignal, time_window_seconds: int = 300) -> bool:
+        """Check if a similar signal was recently processed.
+        
+        Args:
+            signal: The signal to check
+            time_window_seconds: Time window in seconds to check for duplicates
+            
+        Returns:
+            bool: True if a similar signal was recently processed, False otherwise
+        """
+        if not hasattr(self, '_signal_history'):
+            self._signal_history = {}
+            
+        signal_key = f"{signal.symbol}_{signal.signal_type.value}"
+        
+        # Clean up old entries
+        current_time = time.time()
+        if signal_key in self._signal_history:
+            self._signal_history[signal_key] = [
+                ts for ts in self._signal_history[signal_key]
+                if current_time - ts < time_window_seconds
+            ]
+            
+        # Check for recent duplicate
+        if signal_key in self._signal_history and self._signal_history[signal_key]:
+            self.logger.debug(f"Found recent signal for {signal_key} in the last {time_window_seconds}s")
+            return True
+            
+        return False
+        
+    def _update_signal_history(self, signal: TradeSignal) -> None:
+        """Update the signal history with the latest signal.
+        
+        Args:
+            signal: The signal to add to history
+        """
+        if not hasattr(self, '_signal_history'):
+            self._signal_history = {}
+            
+        signal_key = f"{signal.symbol}_{signal.signal_type.value}"
+        
+        if signal_key not in self._signal_history:
+            self._signal_history[signal_key] = []
+            
+        self._signal_history[signal_key].append(time.time())
+        
+        # Keep only the last 10 timestamps to prevent memory leaks
+        self._signal_history[signal_key] = self._signal_history[signal_key][-10:]
+        
+    def get_signal_metrics(self) -> Dict[str, Any]:
+        """Get signal processing metrics.
+        
+        Returns:
+            Dict containing signal processing statistics
+        """
+        return {
+            'signals_processed': self.metrics['signals_processed'],
+            'signals_failed': self.metrics['signals_failed'],
+            'api_errors': self.metrics['api_errors'],
+            'last_error': self.metrics['last_error'],
+            'uptime_minutes': round((datetime.now(self.ist_tz) - self.metrics['start_time']).total_seconds() / 60, 1),
+            'last_signal_time': self.metrics['last_signal_time'].isoformat() 
+                             if self.metrics['last_signal_time'] else None,
+            'queue_size': len(self.signal_monitor.get_queued_signals()) if hasattr(self, 'signal_monitor') else 0
+        }
     
     def _get_previous_candle(self, current_time: datetime) -> Optional[Dict[str, Any]]:
         """Get the previous candle for the given time."""
@@ -568,13 +841,30 @@ class TradingOrchestrator:
     
     def shutdown(self) -> None:
         """Shut down the trading system gracefully."""
-        self.logger.info("Shutting down trading system...")
+        self.logger.info("Initiating system shutdown...")
         self.running = False
         
-        # Close all open positions
-        self.trade_executor.square_off_all_positions()
-        
-        # Cancel all pending orders
-        self.trade_executor.cancel_all_pending_orders()
-        
-        self.logger.info("Trading system shutdown complete")
+        try:
+            # Stop the signal monitor if in live mode
+            if self.mode == 'live' and hasattr(self, 'signal_monitor') and self.signal_monitor:
+                self.signal_monitor.shutdown()
+            
+            # Close any open positions if market is open
+            if hasattr(self, 'trade_executor') and self.trade_executor:
+                if self.mode == 'live' and hasattr(self, 'market_open') and self.market_open:
+                    self.logger.info("Closing all open positions...")
+                self.trade_executor.square_off_all_positions()
+            
+            # Close data provider connection
+            if hasattr(self, 'data_provider') and self.data_provider:
+                self.data_provider.disconnect()
+            
+            # Log final metrics if available
+            if hasattr(self, 'metrics'):
+                self._check_system_health()
+            
+            self.logger.info("Trading system shutdown complete")
+            
+        except Exception as e:
+            self.logger.error(f"Error during shutdown: {str(e)}", exc_info=True)
+            raise

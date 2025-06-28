@@ -36,21 +36,84 @@ class PositionStatus(Enum):
 
 @dataclass
 class TradeSignal:
-    """Represents a trading signal."""
+    """Represents a trading signal with enhanced fields for live trading.
+    
+    Attributes:
+        signal_type: Type of signal (LONG/SHORT)
+        entry_price: Entry price for the trade
+        stop_loss: Stop loss price
+        take_profit: Take profit/target price
+        strike: Strike price for options
+        option_type: 'CE' for call, 'PE' for put
+        timestamp: When the signal was generated
+        spot_price: Underlying spot price when signal was generated
+        expiry_date: Expiry date for the option
+        symbol: Trading symbol (e.g., 'NIFTY')
+        signal_id: Unique identifier for the signal
+        quantity: Number of contracts/shares
+        lot_size: Lot size for the instrument
+        reason: Reason/description for the signal
+        metadata: Additional metadata for the signal
+        status: Current status of the signal
+        parent_signal_id: ID of parent signal if this is a follow-up signal
+    """
     signal_type: TradeSignalType
     entry_price: float
     stop_loss: float
     take_profit: float
     strike: int
-    option_type: str  # 'ce' for call, 'pe' for put
+    option_type: str  # 'CE' for call, 'PE' for put
     timestamp: datetime
     spot_price: float
     expiry_date: Optional[datetime] = None
     symbol: str = "NIFTY"
+    signal_id: str = field(default_factory=lambda: f"sig_{int(datetime.utcnow().timestamp() * 1000)}")
+    quantity: int = 1
+    lot_size: int = 50  # Default NIFTY lot size
+    reason: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    status: str = "PENDING"  # PENDING, PROCESSING, EXECUTED, REJECTED, EXPIRED
+    parent_signal_id: Optional[str] = None
+    
+    def __post_init__(self):
+        # Ensure option type is uppercase
+        if self.option_type:
+            self.option_type = self.option_type.upper()
+    
+    @property
+    def is_call(self) -> bool:
+        """Check if this is a call option signal."""
+        return self.option_type.upper() == 'CE'
+    
+    @property
+    def is_put(self) -> bool:
+        """Check if this is a put option signal."""
+        return self.option_type.upper() == 'PE'
+    
+    @property
+    def is_long(self) -> bool:
+        """Check if this is a long position signal."""
+        return self.signal_type == TradeSignalType.LONG
+    
+    @property
+    def is_short(self) -> bool:
+        """Check if this is a short position signal."""
+        return self.signal_type == TradeSignalType.SHORT
+    
+    @property
+    def contract_symbol(self) -> str:
+        """Generate the full contract symbol (e.g., 'NIFTY25JAN2345000CE')."""
+        if not self.expiry_date:
+            return f"{self.symbol}{self.strike}{self.option_type}"
+            
+        # Format: NIFTY + 2-digit day + 3-char month + 2-digit year + strike + option type
+        expiry_str = self.expiry_date.strftime("%d%b%y").upper()
+        return f"{self.symbol}{expiry_str}{self.strike}{self.option_type}"
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert signal to dictionary."""
+        """Convert signal to dictionary with all fields."""
         return {
+            'signal_id': self.signal_id,
             'signal_type': self.signal_type.value,
             'entry_price': self.entry_price,
             'stop_loss': self.stop_loss,
@@ -60,8 +123,51 @@ class TradeSignal:
             'timestamp': self.timestamp.isoformat(),
             'spot_price': self.spot_price,
             'expiry_date': self.expiry_date.isoformat() if self.expiry_date else None,
-            'symbol': self.symbol
+            'symbol': self.symbol,
+            'quantity': self.quantity,
+            'lot_size': self.lot_size,
+            'reason': self.reason,
+            'status': self.status,
+            'parent_signal_id': self.parent_signal_id,
+            'contract_symbol': self.contract_symbol,
+            'metadata': self.metadata
         }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'TradeSignal':
+        """Create a TradeSignal from a dictionary."""
+        from datetime import datetime
+        from dateutil.parser import parse
+        
+        # Handle timestamp conversion
+        timestamp = data.get('timestamp')
+        if isinstance(timestamp, str):
+            timestamp = parse(timestamp)
+        
+        # Handle expiry_date conversion
+        expiry_date = data.get('expiry_date')
+        if isinstance(expiry_date, str):
+            expiry_date = parse(expiry_date)
+        
+        return cls(
+            signal_type=TradeSignalType[data['signal_type']],
+            entry_price=float(data['entry_price']),
+            stop_loss=float(data['stop_loss']),
+            take_profit=float(data['take_profit']),
+            strike=int(data['strike']),
+            option_type=data['option_type'],
+            timestamp=timestamp or datetime.utcnow(),
+            spot_price=float(data.get('spot_price', 0)),
+            expiry_date=expiry_date,
+            symbol=data.get('symbol', 'NIFTY'),
+            signal_id=data.get('signal_id'),
+            quantity=int(data.get('quantity', 1)),
+            lot_size=int(data.get('lot_size', 50)),
+            reason=data.get('reason'),
+            metadata=data.get('metadata', {}),
+            status=data.get('status', 'PENDING'),
+            parent_signal_id=data.get('parent_signal_id')
+        )
 
 @dataclass
 class Order:

@@ -1,62 +1,192 @@
 """
 Trade execution module for handling order placement and position management.
+
+This module provides functionality for executing trades, managing positions, and
+implementing risk management rules for the trading system.
 """
 import logging
-from typing import Dict, List, Optional, Tuple, Any
-from datetime import datetime, time
+import random
+import math
+from typing import Dict, List, Optional, Tuple, Any, Union
+from datetime import datetime, time, timedelta
 import pytz
+from dataclasses import asdict
 
 from core.models import (
     Order, OrderStatus, OrderType, Position, PositionStatus, 
-    TradeSignal, TradeSignalType, Portfolio
+    TradeSignal, TradeSignalType, Portfolio, TradeError, RiskLimitExceededError,
+    InsufficientFundsError, InvalidSignalError
 )
 from core.config_manager import ConfigManager
 from data.data_provider import DataProvider
+
+# Type aliases
+Numeric = Union[int, float]
 
 class TradeExecutor:
     """Handles trade execution and position management."""
     
     def __init__(self, config: ConfigManager, data_provider: DataProvider, portfolio: Portfolio):
-        """Initialize trade executor.
+        """Initialize trade executor with configuration and dependencies.
         
         Args:
             config: Configuration manager instance
-            data_provider: Data provider instance
-            portfolio: Portfolio instance to manage positions
+            data_provider: Data provider instance for market data
+            portfolio: Portfolio instance to manage positions and cash
+            
+        Raises:
+            ValueError: If required configuration is missing
         """
         self.config = config
         self.data_provider = data_provider
         self.portfolio = portfolio
+        self.ist_tz = pytz.timezone('Asia/Kolkata')
+        
+        # Load configurations
         self.trading_config = config.get_trading_config()
         self.options_config = config.get_options_config()
         self.backtest_config = config.get_backtest_config()
-        self.ist_tz = pytz.timezone('Asia/Kolkata')
+        self.risk_config = config.get_risk_config()
+        
+        # Initialize logger
         self.logger = self._setup_logger()
+        
+        # Order and position tracking
         self.orders: Dict[str, Order] = {}
         self.positions: Dict[str, Position] = {}
-        self.last_trade_time = None
+        self.last_trade_time: Optional[datetime] = None
         
         # Trade and position tracking
         self.current_date = datetime.now(self.ist_tz).date()
         self.daily_trades_count = 0
+        self.daily_pnl = 0.0
+        self.max_daily_trades = self.trading_config.get('max_daily_trades', 10)
+        
+        # Risk management
+        self.max_position_size = self.risk_config.get('max_position_size', 0.1)  # 10% of portfolio
+        self.max_portfolio_risk = self.risk_config.get('max_portfolio_risk', 0.02)  # 2% risk per trade
+        self.max_daily_loss_pct = self.risk_config.get('max_daily_loss_pct', 0.05)  # 5% daily loss limit
+        self.initial_balance = self.portfolio.current_cash
         
         # Signal cooldown tracking
-        self.last_signal_time = None
-        self.min_candle_gap = self.trading_config.get('min_candle_gap_between_signals', 5)  # Default to 5 candles if not set
-        self.logger.info(f"Signal cooldown set to {self.min_candle_gap} candles")
+        self.last_signal_time: Dict[str, datetime] = {}
+        self.signal_cooldown = timedelta(
+            minutes=self.trading_config.get('signal_cooldown_minutes', 5)
+        )
+        
+        # Position tracking
+        self.open_positions: Dict[str, Position] = {}
+        self.closed_positions: List[Position] = []
+        
+        self.logger.info("TradeExecutor initialized with risk management")
+        self.logger.info(f"Max position size: {self.max_position_size*100:.1f}% of portfolio")
+        self.logger.info(f"Max portfolio risk: {self.max_portfolio_risk*100:.1f}% per trade")
+        self.logger.info(f"Max daily loss: {self.max_daily_loss_pct*100:.1f}% of portfolio")
     
     def _setup_logger(self) -> logging.Logger:
-        """Set up logger for the trade executor."""
+        """Set up and configure the logger for the trade executor.
+        
+        Returns:
+            Configured logger instance
+        """
         logger = logging.getLogger(__name__)
+        
+        # Set log level from config or default to INFO
+        log_level = getattr(
+            logging, 
+            self.config.get_logging_config().get('log_level', 'INFO').upper(),
+            logging.INFO
+        )
+        logger.setLevel(log_level)
+        
+        # Create formatter
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        
+        # Add console handler if not already added
+        if not logger.handlers:
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(formatter)
+            logger.addHandler(console_handler)
+        
         return logger
         
+    def _calculate_position_size(
+        self,
+        entry_price: float,
+        stop_loss: float,
+        risk_amount: Optional[float] = None,
+        max_risk_pct: float = 0.02
+    ) -> Tuple[int, float]:
+        """Calculate optimal position size based on risk parameters.
+        
+        Args:
+            entry_price: Entry price of the trade
+            stop_loss: Stop loss price
+            risk_amount: Fixed risk amount in account currency. If None, uses percentage of portfolio.
+            max_risk_pct: Maximum percentage of portfolio to risk (if risk_amount not provided)
+            
+        Returns:
+            Tuple of (quantity, risk_per_share)
+            
+        Raises:
+            RiskLimitExceededError: If calculated position exceeds risk limits
+            InsufficientFundsError: If account doesn't have enough buying power
+        """
+        if entry_price <= 0 or stop_loss <= 0:
+            raise InvalidSignalError("Invalid entry or stop loss price")
+            
+        # Calculate risk per share
+        risk_per_share = abs(entry_price - stop_loss)
+        if risk_per_share <= 0:
+            raise InvalidSignalError("Stop loss too close to entry price")
+        
+        # Determine risk amount based on portfolio
+        if risk_amount is None:
+            risk_amount = self.portfolio.current_cash * max_risk_pct
+            
+        # Calculate position size
+        position_value = (risk_amount / risk_per_share) * entry_price
+        
+        # Check position size against portfolio limits
+        max_position_value = self.portfolio.current_cash * self.max_position_size
+        if position_value > max_position_value:
+            position_value = max_position_value
+            risk_amount = (position_value / entry_price) * risk_per_share
+            
+            if risk_amount <= 0:
+                raise RiskLimitExceededError("Position size below minimum")
+        
+        # Calculate quantity based on lot size (for options)
+        lot_size = 1  # Default for stocks
+        if hasattr(self, 'lot_size'):
+            lot_size = self.lot_size
+            
+        quantity = int((position_value / entry_price) // lot_size) * lot_size
+        
+        # Ensure minimum quantity of 1 lot
+        quantity = max(quantity, lot_size)
+        
+        # Check if we have enough buying power
+        required_capital = entry_price * quantity
+        if required_capital > self.portfolio.current_cash * 1.1:  # 10% buffer for slippage/commissions
+            raise InsufficientFundsError(
+                f"Insufficient funds. Required: {required_capital:.2f}, "
+                f"Available: {self.portfolio.current_cash:.2f}"
+            )
+            
+        return quantity, risk_per_share
+
     def _calculate_fill_price(
         self,
         symbol: str,
         order_type: OrderType,
         price: float,
         quantity: int,
-        is_options: bool = False
+        is_options: bool = False,
+        volatility_adjusted: bool = True
     ) -> float:
         """Calculate fill price with slippage and spread for backtesting.
         
@@ -129,6 +259,137 @@ class TradeExecutor:
         # Check if within market hours
         current_time = now.time()
         return market_open <= current_time <= market_close
+    
+    def _check_risk_limits(self, signal: TradeSignal) -> None:
+        """Check if executing the signal would violate any risk limits.
+        
+        Args:
+            signal: Trade signal to validate
+            
+        Raises:
+            RiskLimitExceededError: If any risk limit would be violated
+            InvalidSignalError: If the signal is invalid
+        """
+        # Check if market is open for trading
+        if not self._is_market_hours():
+            raise TradeError("Market is closed")
+            
+        # Check daily trade limit
+        if self.daily_trades_count >= self.max_daily_trades:
+            raise RiskLimitExceededError(
+                f"Daily trade limit reached: {self.daily_trades_count}/{self.max_daily_trades}"
+            )
+            
+        # Check daily loss limit
+        current_pnl_pct = (self.portfolio.current_cash - self.initial_balance) / self.initial_balance
+        if current_pnl_pct < -self.max_daily_loss_pct:
+            raise RiskLimitExceededError(
+                f"Daily loss limit reached: {current_pnl_pct*100:.2f}%"
+            )
+            
+        # Check position limits
+        if signal.contract_symbol in self.open_positions:
+            if not signal.parent_signal_id:  # New position for existing symbol
+                raise RiskLimitExceededError(
+                    f"Position already exists for {signal.contract_symbol}"
+                )
+    
+    def _process_signal(self, signal: TradeSignal) -> Optional[Position]:
+        """Process a trading signal with risk management.
+        
+        Args:
+            signal: TradeSignal to process
+            
+        Returns:
+            Position if successful, None otherwise
+            
+        Raises:
+            TradeError: For general trade execution errors
+            RiskLimitExceededError: If risk limits would be violated
+            InsufficientFundsError: If account doesn't have enough buying power
+        """
+        try:
+            # Validate signal
+            if not signal or not isinstance(signal, TradeSignal):
+                raise InvalidSignalError("Invalid signal provided")
+                
+            # Check risk limits
+            self._check_risk_limits(signal)
+            
+            # Skip if we're in cooldown for this symbol
+            last_signal_time = self.last_signal_time.get(signal.contract_symbol)
+            if last_signal_time and (datetime.now(self.ist_tz) - last_signal_time) < self.signal_cooldown:
+                self.logger.warning(
+                    f"Skipping signal for {signal.contract_symbol} - in cooldown period"
+                )
+                return None
+            
+            # Calculate position size based on risk
+            entry_price = signal.entry_price
+            stop_loss = signal.stop_loss
+            
+            # Get current market price if available
+            try:
+                current_price = self.data_provider.get_latest_price(
+                    signal.contract_symbol, 
+                    exchange='NFO' if signal.option_type else 'NSE'
+                )
+                if current_price and current_price > 0:
+                    entry_price = current_price
+            except Exception as e:
+                self.logger.warning(f"Could not get current price: {str(e)}")
+            
+            # Calculate position size
+            quantity, risk_per_share = self._calculate_position_size(
+                entry_price=entry_price,
+                stop_loss=stop_loss,
+                max_risk_pct=self.max_portfolio_risk
+            )
+            
+            # Update signal with calculated values
+            signal.quantity = quantity
+            signal.entry_price = entry_price
+            
+            # Place the order
+            order = self.place_order(
+                symbol=signal.contract_symbol,
+                order_type=OrderType.MARKET,
+                quantity=quantity * (1 if signal.is_long else -1),
+                price=entry_price,
+                stop_loss=stop_loss,
+                target_price=signal.take_profit,
+                signal=signal
+            )
+            
+            if not order or order.status != OrderStatus.COMPLETE:
+                raise TradeError(f"Failed to execute order for signal: {signal.signal_id}")
+                
+            # Create and return position
+            position = Position(
+                position_id=f"pos_{signal.signal_id}",
+                signal=signal,
+                entry_order=order,
+                status=PositionStatus.OPEN
+            )
+            
+            # Update portfolio and tracking
+            self.open_positions[signal.contract_symbol] = position
+            self.last_signal_time[signal.contract_symbol] = datetime.now(self.ist_tz)
+            self.daily_trades_count += 1
+            
+            self.logger.info(
+                f"Opened {position.signal.signal_type.value} position {position.position_id} "
+                f"for {signal.contract_symbol} x {quantity} @ {entry_price:.2f} "
+                f"(SL: {stop_loss:.2f}, TP: {signal.take_profit:.2f})"
+            )
+            
+            return position
+            
+        except Exception as e:
+            self.logger.error(f"Error processing signal {getattr(signal, 'signal_id', 'unknown')}: {str(e)}")
+            if not isinstance(e, (RiskLimitExceededError, InsufficientFundsError, InvalidSignalError)):
+                self.logger.exception("Unexpected error in process_signal")
+            raise
     
     def _get_option_instrument(
         self, 
