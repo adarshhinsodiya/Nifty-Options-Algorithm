@@ -347,17 +347,31 @@ class TradeExecutor:
                 self.logger.error(f"Failed to get option instrument for {signal}")
                 return None
             
+            # Get current option premium from market data
+            option_premium = self.data_provider.get_latest_price(option['stock_code'], 'NFO')
+            if option_premium <= 0:
+                self.logger.error(f"Invalid option premium: {option_premium}")
+                return None
+                
             # Calculate position size based on risk
             risk_amount = self.portfolio.current_cash * (self.trading_config.risk_per_trade / 100)
-            risk_per_contract = abs(signal.entry_price - signal.stop_loss) * option['lot_size']
+            
+            # For options, risk is the premium paid/received per contract
+            # Calculate risk per contract based on stop loss percentage of the premium
+            stop_loss_percent = abs((signal.entry_price - signal.stop_loss) / signal.entry_price) if signal.entry_price > 0 else 0.2  # Default 20% if entry price is 0
+            risk_per_contract = option_premium * stop_loss_percent * option['lot_size']
             
             if risk_per_contract <= 0:
                 self.logger.error(f"Invalid risk per contract: {risk_per_contract}")
                 return None
             
-            # Calculate number of lots to trade
-            num_lots = int(risk_amount / risk_per_contract)
+            # Calculate number of lots to trade based on risk per contract
+            num_lots = int(risk_amount / risk_per_contract) if risk_per_contract > 0 else 1
             num_lots = max(1, min(num_lots, 10))  # Limit to 10 lots max
+            
+            # Update signal with actual premium for tracking
+            signal.entry_price = option_premium
+            signal.stop_loss = option_premium * (1 - stop_loss_percent)  # Adjust stop loss based on premium
             
             # Place entry order
             quantity = num_lots * option['lot_size']
@@ -393,7 +407,8 @@ class TradeExecutor:
             self.logger.info(
                 f"Position opened: {position.position_id} | {signal.signal_type.value} | "
                 f"{signal.option_type.upper()} {signal.strike} | "
-                f"Entry: {order.average_price} | SL: {signal.stop_loss} | TP: {signal.take_profit}"
+                f"Entry: {order.average_price:.2f} | SL: {signal.stop_loss:.2f} | TP: {signal.take_profit:.2f} | "
+                f"Lots: {num_lots} | Premium: {option_premium:.2f}"
             )
             
             return position
