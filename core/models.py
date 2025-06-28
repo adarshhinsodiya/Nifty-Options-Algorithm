@@ -150,20 +150,43 @@ class Portfolio:
     positions: List[Position] = field(default_factory=list)
     closed_positions: List[Position] = field(default_factory=list)
     
-    def add_position(self, position: Position) -> None:
-        """Add a new position to the portfolio."""
+    def add_position(self, position: Position, commission: float = 0.0) -> None:
+        """Add a new position to the portfolio.
+        
+        Args:
+            position: Position to add
+            commission: Commission rate per trade (as a decimal, e.g., 0.0005 for 0.05%)
+        """
         self.positions.append(position)
-        self.current_cash -= position.entry_order.average_price * position.entry_order.quantity
+        trade_value = position.entry_order.average_price * abs(position.entry_order.quantity)
+        commission_cost = trade_value * commission
+        self.current_cash -= (trade_value + commission_cost)
+        position.entry_order.commission = commission_cost  # Store commission for reporting
     
-    def close_position(self, position: Position, exit_order: Order, reason: str) -> None:
-        """Close an open position."""
+    def close_position(self, position: Position, exit_order: Order, reason: str, commission: float = 0.0) -> None:
+        """Close an open position.
+        
+        Args:
+            position: Position to close
+            exit_order: Exit order details
+            reason: Reason for closing the position
+            commission: Commission rate per trade (as a decimal, e.g., 0.0005 for 0.05%)
+        """
         if position not in self.positions:
             raise ValueError("Position not found in open positions")
             
         position.close_position(exit_order, reason)
+        
+        # Calculate and deduct commission
+        trade_value = exit_order.average_price * abs(exit_order.quantity)
+        commission_cost = trade_value * commission
+        exit_order.commission = commission_cost  # Store commission for reporting
+        
+        # Update portfolio cash (subtract commission from proceeds)
+        self.current_cash += (trade_value - commission_cost)
+        
         self.positions.remove(position)
         self.closed_positions.append(position)
-        self.current_cash += exit_order.average_price * exit_order.quantity
     
     def get_open_positions(self) -> List[Position]:
         """Get all open positions."""
@@ -182,9 +205,25 @@ class Portfolio:
                 position_value += current_prices[symbol] * position.entry_order.quantity
         return self.current_cash + position_value
     
-    def get_total_pnl(self) -> float:
-        """Calculate total P&L for all closed positions."""
-        return sum(p.pnl for p in self.closed_positions if p.pnl is not None)
+    def get_total_pnl(self, include_commissions: bool = True) -> float:
+        """Calculate total P&L for all closed positions.
+        
+        Args:
+            include_commissions: Whether to include commission costs in P&L calculation
+            
+        Returns:
+            float: Total P&L, optionally including commission costs
+        """
+        total_pnl = 0.0
+        for position in self.closed_positions:
+            if position.pnl is not None:
+                pnl = position.pnl
+                if include_commissions and hasattr(position.entry_order, 'commission'):
+                    pnl -= position.entry_order.commission
+                if include_commissions and position.exit_order and hasattr(position.exit_order, 'commission'):
+                    pnl -= position.exit_order.commission
+                total_pnl += pnl
+        return total_pnl
     
     def get_win_rate(self) -> float:
         """Calculate win rate for closed positions."""

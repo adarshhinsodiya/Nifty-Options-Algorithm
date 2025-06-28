@@ -467,231 +467,318 @@ class TradeExecutor:
             return False
             
         return True
+        
+    def _place_bracket_orders(
+        self,
+        main_order: Order,
+        stop_loss: float,
+        target_price: float,
+        signal: Optional[TradeSignal] = None
+    ) -> None:
+        """Place bracket orders (SL and target) for the main order.
+        
+        Args:
+            main_order: The main order to place brackets for
+            stop_loss: Stop loss price
+            target_price: Target price
+            signal: Optional TradeSignal object for options orders
+        """
+        try:
+            # Common order parameters
+            order_params = {
+                'exchange_code': 'NFO',
+                'product': 'options',
+                'quantity': abs(main_order.quantity),
+                'validity': 'day',
+                'disclosed_quantity': 0,
+                'trader_id': ''
+            }
+            
+            # Add option-specific parameters if signal is provided
+            if signal and signal.expiry_date:
+                order_params.update({
+                    'expiry_date': signal.expiry_date.strftime('%d-%m-%Y'),
+                    'right': signal.option_type.upper(),
+                    'strike_price': signal.strike
+                })
+            
+            if stop_loss > 0:
+                # Place stop loss order
+                sl_order_id = f"{main_order.order_id}_SL"
+                sl_order = Order(
+                    order_id=sl_order_id,
+                    symbol=main_order.symbol,
+                    order_type=OrderType.SL,
+                    quantity=main_order.quantity,
+                    price=stop_loss,
+                    status=OrderStatus.PENDING,
+                    parent_order_id=main_order.order_id
+                )
+                
+                # In live mode, place actual SL order
+                if self.data_provider.mode == 'live':
+                    sl_params = order_params.copy()
+                    sl_params.update({
+                        'stock_code': main_order.symbol,
+                        'action': 'sell' if main_order.quantity > 0 else 'buy',
+                        'order_type': 'stoploss',
+                        'stoploss': stop_loss,
+                        'price': 0,  # Market order for SL
+                        'tag': f"SL_{main_order.order_id}"
+                    })
+                    
+                    sl_response = self.data_provider.breeze.place_order(**sl_params)
+                    
+                    if sl_response and 'Success' in sl_response:
+                        sl_order.exchange_order_id = sl_response['Success']['order_id']
+                        sl_order.status = OrderStatus.OPEN
+                    else:
+                        self.logger.error(f"Failed to place SL order: {sl_response}")
+                
+                self.orders[sl_order_id] = sl_order
+                
+            if target_price > 0:
+                # Place target order
+                tgt_order_id = f"{main_order.order_id}_TGT"
+                tgt_order = Order(
+                    order_id=tgt_order_id,
+                    symbol=main_order.symbol,
+                    order_type=OrderType.LIMIT,
+                    quantity=main_order.quantity,
+                    price=target_price,
+                    status=OrderStatus.PENDING,
+                    parent_order_id=main_order.order_id
+                )
+                
+                # In live mode, place actual target order
+                if self.data_provider.mode == 'live':
+                    tgt_params = order_params.copy()
+                    tgt_params.update({
+                        'stock_code': main_order.symbol,
+                        'action': 'sell' if main_order.quantity > 0 else 'buy',
+                        'order_type': 'limit',
+                        'stoploss': 0,
+                        'price': target_price,
+                        'tag': f"TGT_{main_order.order_id}"
+                    })
+                    
+                    tgt_response = self.data_provider.breeze.place_order(**tgt_params)
+                    
+                    if tgt_response and 'Success' in tgt_response:
+                        tgt_order.exchange_order_id = tgt_response['Success']['order_id']
+                        tgt_order.status = OrderStatus.OPEN
+                    else:
+                        self.logger.error(f"Failed to place target order: {tgt_response}")
+                
+                self.orders[tgt_order_id] = tgt_order
+                
+        except Exception as e:
+            self.logger.error(f"Error placing bracket orders: {str(e)}")
     
+    def _is_in_cooldown(self) -> bool:
+        """Check if we're in a cooldown period after the last signal.
+        
+        Returns:
+            bool: True if in cooldown, False otherwise
+        """
+        if self.last_signal_time is None:
+            return False
+                
+        # Calculate time difference in minutes
+        time_diff = (datetime.now(self.ist_tz) - self.last_signal_time).total_seconds() / 60
+            
+        # Convert candle gap to minutes (assuming 1m candles)
+        cooldown_minutes = self.min_candle_gap * 1  # 1 minute per candle
+            
+        if time_diff < cooldown_minutes:
+            remaining = cooldown_minutes - time_diff
+            self.logger.debug(f"In cooldown period: {remaining:.1f} minutes remaining")
+            return True
+                
+        return False
+
+    def _check_daily_trades_limit(self) -> bool:
+        """Check if we've reached the maximum number of daily trades.
+        
+        Returns:
+            bool: True if we can place more trades today, False otherwise
+        """
+        current_date = datetime.now(self.ist_tz).date()
+            
+        # Reset daily counter if it's a new day
+        if current_date != self.current_date:
+            self.current_date = current_date
+            self.daily_trades_count = 0
+            self.logger.debug(f"New trading day: {self.current_date}")
+            
+        # Check against max daily trades limit
+        max_daily = self.trading_config.max_daily_trades
+        if max_daily > 0 and self.daily_trades_count >= max_daily:
+            self.logger.warning(
+                f"Daily trade limit reached: {self.daily_trades_count}/{max_daily} "
+                "trades used today"
+            )
+            return False
+                
+        return True
+        
+    def _check_max_positions(self) -> bool:
+        """Check if we can open a new position based on max_open_positions.
+        
+        Returns:
+            bool: True if we can open a new position, False otherwise
+        """
+        max_positions = self.trading_config.max_open_positions
+        if max_positions <= 0:  # No limit if zero or negative
+            return True
+                
+        current_positions = len(self.portfolio.get_open_positions())
+        if current_positions >= max_positions:
+            self.logger.warning(
+                f"Maximum open positions limit reached: {current_positions}/{max_positions}"
+            )
+            return False
+                
+        return True
+        
+    def _is_trading_day(self, date: datetime) -> bool:
+        """Check if the given date is a trading day (weekday and not a holiday).
+        
+        Args:
+            date: Date to check
+                
+        Returns:
+            bool: True if it's a trading day, False otherwise
+        """
+        # Check if it's a weekend
+        if date.weekday() >= 5:  # 5=Saturday, 6=Sunday
+            return False
+                
+        # Check if it's a holiday (you'll need to implement holiday checking)
+        # For now, we'll assume no holidays - you should replace this with actual holiday checking
+        # Example: if date.date() in self._get_market_holidays():
+        #     return False
+                
+        return True
+            
+    def _get_commission_rate(self) -> float:
+        """Get the commission rate from backtest config.
+        
+        Returns:
+            float: Commission rate as a decimal (e.g., 0.0005 for 0.05%)
+        """
+        return self.backtest_config.commission if hasattr(self.backtest_config, 'commission') else 0.0
+
     def execute_signal(self, signal: TradeSignal) -> Optional[Position]:
         """Execute a trading signal.
         
         Args:
             signal: Trading signal to execute
-            
+                
         Returns:
             Position object if successful, None otherwise
         """
         try:
+            # Skip if it's not a trading day (for backtest)
+            if self.data_provider.mode == 'backtest' and not self._is_trading_day(signal.timestamp):
+                self.logger.debug(f"Skipping signal on non-trading day: {signal.timestamp.date()}")
+                return None
+                    
             # Check position limits
             if not self._check_max_positions():
                 return None
-                
+                    
             # Check daily trade limits
             if not self._check_daily_trades_limit():
                 return None
-                
+                    
             # Check cooldown period
             if self._is_in_cooldown():
                 self.logger.debug("Skipping signal: In cooldown period")
                 return None
-                
-            # Check if we already have an open position for this signal
-            for position in self.portfolio.get_open_positions():
-                if (
-                    position.signal.signal_type == signal.signal_type and
-                    position.signal.option_type == signal.option_type and
-                    position.signal.strike == signal.strike
-                ):
-                    self.logger.info(f"Position already open for signal: {signal}")
-                    return None
-            
+                    
+            # Check if market is open (for live trading)
+            if self.data_provider.mode == 'live' and not self._is_market_hours():
+                self.logger.debug("Skipping signal: Market is closed")
+                return None
+                    
             # Get option instrument details
-            option = self._get_option_instrument(
+            expiry_date = signal.expiry_date or self._get_next_expiry()
+            option_instrument = self._get_option_instrument(
                 symbol=signal.symbol,
                 strike=signal.strike,
                 option_type=signal.option_type,
-                expiry_date=signal.expiry_date
+                expiry_date=expiry_date
             )
             
-            if not option:
-                self.logger.error(f"Failed to get option instrument for {signal}")
+            if not option_instrument:
+                self.logger.error(f"Could not find option instrument for {signal}")
                 return None
             
-            # Get current option premium from market data
-            option_premium = self.data_provider.get_latest_price(option['stock_code'], 'NFO')
-            if option_premium <= 0:
-                self.logger.error(f"Invalid option premium: {option_premium}")
-                return None
-                
             # Calculate position size based on risk
             risk_amount = self.portfolio.current_cash * (self.trading_config.risk_per_trade / 100)
+            position_size = int(risk_amount / (signal.entry_price * self.options_config.lot_size))
             
-            # For options, risk is the premium paid/received per contract
-            # Calculate risk per contract based on stop loss percentage of the premium
-            stop_loss_percent = abs((signal.entry_price - signal.stop_loss) / signal.entry_price) if signal.entry_price > 0 else 0.2  # Default 20% if entry price is 0
-            risk_per_contract = option_premium * stop_loss_percent * option['lot_size']
-            
-            if risk_per_contract <= 0:
-                self.logger.error(f"Invalid risk per contract: {risk_per_contract}")
+            if position_size < 1:
+                self.logger.warning(f"Position size too small: {position_size} (risk: {risk_amount:.2f})")
                 return None
-            
-            # Calculate number of lots to trade based on risk per contract
-            num_lots = int(risk_amount / risk_per_contract) if risk_per_contract > 0 else 1
-            num_lots = max(1, min(num_lots, 10))  # Limit to 10 lots max
-            
-            # Update signal with actual premium for tracking
-            signal.entry_price = option_premium
-            signal.stop_loss = option_premium * (1 - stop_loss_percent)  # Adjust stop loss based on premium
+                    
+            # Calculate quantity (positive for long, negative for short)
+            quantity = position_size * self.options_config.lot_size
+            if signal.signal_type == TradeSignalType.SHORT:
+                quantity = -quantity
             
             # Place entry order
-            quantity = num_lots * option['lot_size']
             order = self.place_order(
-                symbol=option['stock_code'],
+                symbol=option_instrument['tradingSymbol'],
                 order_type=OrderType.MARKET,
                 quantity=quantity,
-                price=0,  # Market order
                 product='options',
                 exchange_code='NFO',
-                stop_loss=signal.stop_loss,
-                target_price=signal.take_profit,
-                tag=f"ENTRY_{signal.signal_type.value}_{datetime.now(self.ist_tz).strftime('%H%M%S')}",
-                signal=signal  # Pass the signal for options parameters
+                tag=f"ENTRY_{signal.signal_type.value}",
+                signal=signal
             )
-            
-            # Update tracking if order was placed successfully
-            if order and order.status == OrderStatus.COMPLETE:
-                self.daily_trades_count += 1
-                self.last_signal_time = datetime.now(self.ist_tz)
-                self.logger.debug(f"Signal executed at {self.last_signal_time}")
             
             if not order or order.status != OrderStatus.COMPLETE:
-                self.logger.error(f"Failed to place entry order for {signal}")
+                self.logger.error(f"Failed to execute entry order for signal: {signal}")
                 return None
-            
+                    
             # Create position
             position = Position(
-                position_id=f"POS_{order.order_id}",
+                position_id=order.order_id,
                 signal=signal,
-                entry_order=order,
-                status=PositionStatus.OPEN
+                entry_order=order
             )
             
-            # Add position to portfolio
-            self.portfolio.add_position(position)
+            # Add to portfolio with commission
+            commission_rate = self._get_commission_rate()
+            self.portfolio.add_position(position, commission=commission_rate)
+            
+            # Log commission cost
+            if hasattr(order, 'commission'):
+                self.logger.debug(f"Paid {order.commission:.2f} in commission for entry order {order.order_id}")
+            
+            # Place bracket orders (SL and target)
+            if signal.stop_loss > 0 or signal.take_profit > 0:
+                self._place_bracket_orders(
+                    main_order=order,
+                    stop_loss=signal.stop_loss,
+                    target_price=signal.take_profit,
+                    signal=signal
+                )
+            
+            # Update trade tracking
             self.positions[position.position_id] = position
-            
-            self.logger.info(
-                f"Position opened: {position.position_id} | {signal.signal_type.value} | "
-                f"{signal.option_type.upper()} {signal.strike} | "
-                f"Entry: {order.average_price:.2f} | SL: {signal.stop_loss:.2f} | TP: {signal.take_profit:.2f} | "
-                f"Lots: {num_lots} | Premium: {option_premium:.2f}"
-            )
+            self.last_trade_time = datetime.now(self.ist_tz)
+            self.daily_trades_count += 1
+            self.last_signal_time = datetime.now(self.ist_tz)
             
             return position
             
         except Exception as e:
-            self.logger.error(f"Error executing signal {signal}: {str(e)}")
+            self.logger.error(f"Error executing signal: {str(e)}", exc_info=True)
             return None
-    
-    def manage_positions(self) -> None:
-        """Monitor and manage open positions (check SL/TP)."""
-        try:
-            current_time = datetime.now(self.ist_tz)
-            
-            for position in self.portfolio.get_open_positions():
-                # Skip if position is already closed
-                if position.status != PositionStatus.OPEN:
-                    continue
-                
-                # Get current price
-                current_price = self.data_provider.get_latest_price(
-                    position.entry_order.symbol, 'NFO'
-                )
-                
-                if current_price <= 0:
-                    self.logger.warning(f"Invalid price for {position.entry_order.symbol}")
-                    continue
-                
-                signal = position.signal
-                exit_reason = None
-                exit_price = 0.0
-                
-                # Check stop loss
-                if (
-                    (signal.signal_type == TradeSignalType.LONG and current_price <= signal.stop_loss) or
-                    (signal.signal_type == TradeSignalType.SHORT and current_price >= signal.stop_loss)
-                ):
-                    exit_reason = "STOPPED_OUT"
-                    exit_price = signal.stop_loss
-                
-                # Check take profit
-                elif (
-                    (signal.signal_type == TradeSignalType.LONG and current_price >= signal.take_profit) or
-                    (signal.signal_type == TradeSignalType.SHORT and current_price <= signal.take_profit)
-                ):
-                    exit_reason = "TAKE_PROFIT"
-                    exit_price = signal.take_profit
-                
-                # Check end of day (EOD)
-                elif current_time.time() >= time(15, 15):  # 3:15 PM IST
-                    exit_reason = "EOD_EXIT"
-                    exit_price = current_price
-                
-                # Exit position if any condition is met
-                if exit_reason:
-                    self._exit_position(position, exit_price, exit_reason)
-                    
-        except Exception as e:
-            self.logger.error(f"Error managing positions: {str(e)}")
-    
-    def _exit_position(
-        self, 
-        position: Position, 
-        exit_price: float,
-        reason: str
-    ) -> None:
-        """Exit a position with the given reason."""
-        try:
-            # Place exit order
-            exit_order = self.place_order(
-                symbol=position.entry_order.symbol,
-                order_type=OrderType.MARKET,
-                quantity=-position.entry_order.quantity,  # Opposite of entry
-                product='options',
-                exchange_code='NFO',
-                tag=f"EXIT_{reason}_{position.position_id}"
-            )
-            
-            if not exit_order or exit_order.status != OrderStatus.COMPLETE:
-                self.logger.error(f"Failed to place exit order for {position.position_id}")
-                return
-            
-            # Close the position
-            self.portfolio.close_position(position, exit_order, reason)
-            
-            # Calculate P&L
-            entry_price = position.entry_order.average_price
-            exit_price = exit_order.average_price
-            
-            if position.signal.signal_type == TradeSignalType.LONG:
-                pnl = (exit_price - entry_price) * position.entry_order.quantity
-            else:  # SHORT
-                pnl = (entry_price - exit_price) * position.entry_order.quantity
-            
-            pnl_pct = (pnl / (entry_price * position.entry_order.quantity)) * 100
-            
-            self.logger.info(
-                f"Position closed: {position.position_id} | {position.signal.signal_type.value} | "
-                f"Entry: {entry_price:.2f} | Exit: {exit_price:.2f} | "
-                f"P&L: {pnl:.2f} ({pnl_pct:.2f}%) | Reason: {reason}"
-            )
-            
-        except Exception as e:
-            self.logger.error(f"Error exiting position {position.position_id}: {str(e)}")
-    
-    def square_off_all_positions(self) -> None:
-        """Square off all open positions at market price."""
-        self.logger.info("Squaring off all open positions...")
         
-        for position in self.portfolio.get_open_positions():
-            self._exit_position(position, 0, "MANUAL_EXIT")
-    
     def cancel_all_pending_orders(self) -> None:
         """Cancel all pending orders."""
         self.logger.info("Canceling all pending orders...")
