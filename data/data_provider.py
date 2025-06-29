@@ -61,6 +61,9 @@ class DataProvider:
         # WebSocket related attributes
         self._websocket_handler = None
         self._active_subscriptions = set()  # Track active subscriptions
+        self._tick_store = {}  # Store latest ticks by symbol
+        self._candle_store = {}  # Store 1-minute candles by symbol
+        self._tick_lock = threading.Lock()  # Thread lock for tick store access
         
         if self.mode == 'live':
             self._initialize_breeze_api()
@@ -103,10 +106,124 @@ class DataProvider:
             
         try:
             self._websocket_handler = WebSocketHandler(self.breeze, self.logger)
+            # Register callback for tick data
+            self._websocket_handler.register_callback('tick', self._process_tick_data)
             self.logger.info("WebSocket handler initialized")
         except Exception as e:
             self.logger.error(f"Failed to initialize WebSocket handler: {str(e)}")
             raise
+            
+    def _process_tick_data(self, tick_data: Dict[str, Any]) -> None:
+        """Process incoming tick data and update tick store.
+        
+        Args:
+            tick_data: Dictionary containing tick data
+        """
+        try:
+            if not tick_data or 'symbol' not in tick_data:
+                return
+                
+            symbol = tick_data['symbol']
+            tick_time = tick_data.get('datetime', datetime.now(self.ist_tz))
+            
+            if not isinstance(tick_time, datetime):
+                tick_time = datetime.fromisoformat(tick_time) if isinstance(tick_time, str) else datetime.now(self.ist_tz)
+                
+            # Update tick store with latest price
+            with self._tick_lock:
+                self._tick_store[symbol] = {
+                    'symbol': symbol,
+                    'price': tick_data.get('last', tick_data.get('ltp', 0)),
+                    'volume': tick_data.get('volume', 0),
+                    'timestamp': tick_time,
+                    'bid': tick_data.get('bid', 0),
+                    'ask': tick_data.get('ask', 0)
+                }
+                
+                # Update 1-minute candles
+                self._update_candle_store(symbol, tick_data, tick_time)
+                
+        except Exception as e:
+            self.logger.error(f"Error processing tick data: {str(e)}", exc_info=True)
+    
+    def _update_candle_store(self, symbol: str, tick_data: Dict[str, Any], tick_time: datetime) -> None:
+        """Update 1-minute candle store with new tick data.
+        
+        Args:
+            symbol: Trading symbol
+            tick_data: Tick data
+            tick_time: Timestamp of the tick
+        """
+        try:
+            current_minute = tick_time.replace(second=0, microsecond=0)
+            price = tick_data.get('last', tick_data.get('ltp', 0))
+            
+            with self._tick_lock:
+                if symbol not in self._candle_store:
+                    self._candle_store[symbol] = {}
+                    
+                if current_minute not in self._candle_store[symbol]:
+                    # Create new candle
+                    self._candle_store[symbol][current_minute] = {
+                        'open': price,
+                        'high': price,
+                        'low': price,
+                        'close': price,
+                        'volume': tick_data.get('volume', 0),
+                        'count': 1
+                    }
+                else:
+                    # Update existing candle
+                    candle = self._candle_store[symbol][current_minute]
+                    candle['high'] = max(candle['high'], price)
+                    candle['low'] = min(candle['low'], price)
+                    candle['close'] = price
+                    candle['volume'] += tick_data.get('volume', 0)
+                    candle['count'] += 1
+                    
+                # Clean up old candles (keep last 1000)
+                if len(self._candle_store[symbol]) > 1000:
+                    oldest_minute = min(self._candle_store[symbol].keys())
+                    del self._candle_store[symbol][oldest_minute]
+                    
+        except Exception as e:
+            self.logger.error(f"Error updating candle store: {str(e)}", exc_info=True)
+    
+    def get_latest_price(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get the latest price data for a symbol.
+        
+        Args:
+            symbol: Trading symbol
+            
+        Returns:
+            Latest price data or None if not available
+        """
+        with self._tick_lock:
+            return self._tick_store.get(symbol, None)
+    
+    def get_latest_candles(self, symbol: str, num_candles: int = 20) -> List[Dict[str, Any]]:
+        """Get the latest N candles for a symbol.
+        
+        Args:
+            symbol: Trading symbol
+            num_candles: Number of candles to return
+            
+        Returns:
+            List of candle data dictionaries
+        """
+        with self._tick_lock:
+            if symbol not in self._candle_store or not self._candle_store[symbol]:
+                return []
+                
+            # Get the most recent candles
+            sorted_minutes = sorted(self._candle_store[symbol].keys(), reverse=True)
+            latest_minutes = sorted_minutes[:num_candles]
+            
+            # Return candles in chronological order
+            return [
+                {'timestamp': minute, **self._candle_store[symbol][minute]} 
+                for minute in sorted(latest_minutes)
+            ]
     
     def subscribe_realtime_data(
         self, 

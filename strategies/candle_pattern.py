@@ -12,13 +12,23 @@ from core.models import TradeSignal, TradeSignalType
 from core.config_manager import ConfigManager
 
 class CandlePatternStrategy(BaseStrategy):
-    """Implements the candle pattern trading strategy."""
+    """Implements the candle pattern trading strategy with WebSocket-based real-time data."""
     
-    def __init__(self, config: ConfigManager):
-        """Initialize the strategy with configuration."""
+    def __init__(self, config: ConfigManager, data_provider=None):
+        """Initialize the strategy with configuration and data provider.
+        
+        Args:
+            config: Configuration manager instance
+            data_provider: Optional data provider for real-time data
+        """
         super().__init__(config)
         self.options_config = config.get_options_config()
+        self.data_provider = data_provider
         self.market_data = None
+        self._last_analysis_time = None
+        self._last_signal = None
+        self._candle_cache = {}  # Cache for 1-minute candles by symbol
+        self._tick_cache = {}  # Cache for latest ticks by symbol
     
     def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
         """Calculate Average True Range (ATR) for volatility measurement."""
@@ -93,11 +103,17 @@ class CandlePatternStrategy(BaseStrategy):
             prev = df.iloc[-2]     # Previous candle
             
             # Debug log candle data
-            self.logger.debug(f"Current candle: O:{current['open']} H:{current['high']} L:{current['low']} C:{current['close']}")
-            self.logger.debug(f"Previous candle: O:{prev['open']} H:{prev['high']} L:{prev['low']} C:{prev['close']}")
+            self.logger.debug(f"Analyzing candles - Current: O:{current['open']} H:{current['high']} L:{current['low']} C:{current['close']}")
+            self.logger.debug(f"Previous: O:{prev['open']} H:{prev['high']} L:{prev['low']} C:{prev['close']}")
             
-        except IndexError:
-            self.logger.error("Error accessing candle data")
+            # Check for valid price data
+            if any(pd.isna(x) for x in [current['open'], current['high'], current['low'], current['close'],
+                                       prev['open'], prev['high'], prev['low'], prev['close']]):
+                self.logger.warning("Missing or invalid price data in candles")
+                return SignalDirection.NONE, None
+                
+        except (IndexError, KeyError) as e:
+            self.logger.error(f"Error accessing candle data: {str(e)}")
             return SignalDirection.NONE, None
 
         # Validate data
@@ -196,37 +212,80 @@ class CandlePatternStrategy(BaseStrategy):
             
         return SignalDirection.NONE, None
     
-    def check_entry_conditions(self, data: pd.DataFrame) -> bool:
+    def check_entry_conditions(self, data: pd.DataFrame = None) -> bool:
         """Check if entry conditions are met for a new position.
         
+        Args:
+            data: Optional DataFrame with OHLCV data. If None, uses real-time data.
+            
         Returns:
             bool: True if entry conditions are met, False otherwise
         """
-        if len(data) < 2:
-            return False
-            
         # Check if we already have an open position
         if self.current_position is not None:
             return False
             
         # Check cooldown period
+        current_time = datetime.now(self.ist_tz)
         if self.last_signal_time is not None:
-            time_since_last_signal = datetime.now(self.ist_tz) - self.last_signal_time
+            time_since_last_signal = current_time - self.last_signal_time
             min_seconds_between_signals = self.signal_config.get('min_seconds_between_signals', 300)
             if time_since_last_signal.total_seconds() < min_seconds_between_signals:
                 return False
         
-        # Analyze candle patterns
-        signal_direction, _ = self._analyze_candle_pattern(data)
-        return signal_direction != SignalDirection.NONE
+        # If data is provided, use it for analysis
+        if data is not None and len(data) >= 2:
+            signal_direction, _ = self._analyze_candle_pattern(data)
+            return signal_direction != SignalDirection.NONE
+            
+        # Otherwise, use real-time data if available
+        if self.data_provider:
+            # Get the latest candles for analysis
+            symbol = self.trading_config.symbol
+            candles = self.data_provider.get_latest_candles(symbol, num_candles=20)
+            
+            if len(candles) >= 2:
+                # Convert to DataFrame for analysis
+                df = pd.DataFrame(candles)
+                df.set_index('timestamp', inplace=True)
+                
+                # Analyze the latest candles
+                signal_direction, _ = self._analyze_candle_pattern(df)
+                return signal_direction != SignalDirection.NONE
+                
+        return False
     
-    def check_exit_conditions(self, data: pd.DataFrame, position: TradeSignal) -> bool:
-        """Check if exit conditions are met for an existing position."""
-        if len(data) < 1:
+    def check_exit_conditions(self, data: pd.DataFrame = None, position: TradeSignal = None) -> bool:
+        """Check if exit conditions are met for an existing position.
+        
+        Args:
+            data: Optional DataFrame with OHLCV data. If None, uses real-time data.
+            position: The position to check exit conditions for
+            
+        Returns:
+            bool: True if exit conditions are met, False otherwise
+        """
+        if position is None and self.current_position is not None:
+            position = self.current_position
+            
+        if position is None:
             return False
             
-        current_price = data.iloc[-1]['close']
+        # Get current price from real-time data or provided data
+        current_price = None
         
+        if data is not None and len(data) > 0:
+            current_price = data.iloc[-1]['close']
+        elif self.data_provider:
+            # Try to get the latest price from the data provider
+            price_data = self.data_provider.get_latest_price(position.symbol)
+            if price_data:
+                current_price = price_data['price']
+                
+        if current_price is None:
+            self.logger.warning("Could not determine current price for exit check")
+            return False
+            
         # Check stop loss
         if position.signal_type == TradeSignalType.LONG and current_price <= position.stop_loss:
             self.logger.info(f"Stop loss hit for {position.signal_type} position at {current_price}")
@@ -252,21 +311,41 @@ class CandlePatternStrategy(BaseStrategy):
             
         return False
     
-    def generate_entry_signal(self, data: pd.DataFrame) -> Optional[TradeSignal]:
+    def generate_entry_signal(self, data: pd.DataFrame = None) -> Optional[TradeSignal]:
         """Generate a trade signal for entry.
         
         This is called only after check_entry_conditions() returns True.
         
         Args:
-            data: DataFrame containing OHLCV data
+            data: Optional DataFrame containing OHLCV data. If None, uses real-time data.
             
         Returns:
             TradeSignal: The generated trade signal or None if no signal
         """
-        signal_direction, signal = self._analyze_candle_pattern(data)
-        if signal_direction != SignalDirection.NONE and signal is not None:
-            self.last_signal_time = datetime.now(self.ist_tz)
-            return signal
+        # If data is provided, use it for signal generation
+        if data is not None and len(data) >= 2:
+            signal_direction, signal = self._analyze_candle_pattern(data)
+            if signal_direction != SignalDirection.NONE and signal is not None:
+                self.last_signal_time = datetime.now(self.ist_tz)
+                return signal
+                
+        # Otherwise, use real-time data if available
+        if self.data_provider:
+            # Get the latest candles for analysis
+            symbol = self.trading_config.symbol
+            candles = self.data_provider.get_latest_candles(symbol, num_candles=20)
+            
+            if len(candles) >= 2:
+                # Convert to DataFrame for analysis
+                df = pd.DataFrame(candles)
+                df.set_index('timestamp', inplace=True)
+                
+                # Generate signal from the latest data
+                signal_direction, signal = self._analyze_candle_pattern(df)
+                if signal_direction != SignalDirection.NONE and signal is not None:
+                    self.last_signal_time = datetime.now(self.ist_tz)
+                    return signal
+                    
         return None
     
     def generate_exit_signal(self, data: pd.DataFrame, position: TradeSignal) -> Optional[TradeSignal]:

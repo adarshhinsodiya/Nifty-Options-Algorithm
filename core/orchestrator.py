@@ -74,7 +74,18 @@ class TradingOrchestrator:
             'start_time': datetime.now(self.ist_tz),
             'last_signal_time': None
         }
-    
+        
+        # Real-time trading state
+        self._last_tick_time = None
+        self._last_analysis_time = None
+        self._analysis_interval = 5  # seconds between strategy analysis
+        self._tick_count = 0
+        self._tick_window = 10  # Number of ticks to process in each batch
+        self._tick_buffer = []
+        
+        # Initialize signal history for deduplication
+        self._signal_history = deque(maxlen=100)  # Keep last 100 signals
+        
     def _setup_logging(self) -> None:
         """Configure logging for the application."""
         log_config = self.config.get_logging_config()
@@ -343,8 +354,9 @@ class TradingOrchestrator:
             self.logger.error(f"Error processing ticks: {str(e)}", exc_info=True)
     
     def _setup_realtime_data(self) -> None:
-        """Set up real-time data subscription."""
-        symbol = self.config.get_trading_config().symbol
+        """Set up real-time data subscription for both index and options."""
+        trading_config = self.config.get_trading_config()
+        symbol = trading_config.symbol
         
         # Subscribe to index/stock data
         self.data_provider.subscribe_feeds(
@@ -359,6 +371,58 @@ class TradingOrchestrator:
             ],
             self._on_tick
         )
+        
+        # Subscribe to options chain if trading options
+        if hasattr(trading_config, 'trade_options') and trading_config.trade_options:
+            self._subscribe_to_options_chain(symbol)
+    
+    def _subscribe_to_options_chain(self, symbol: str) -> None:
+        """Subscribe to options chain for the given symbol."""
+        try:
+            # Get current expiry options chain
+            expiry_date = self._get_nearest_expiry()
+            
+            # Get ATM strike price
+            index_data = self.data_provider.get_historical_data(
+                symbol=symbol,
+                from_date=(datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d'),
+                to_date=datetime.now().strftime('%Y-%m-%d'),
+                interval='1d'
+            )
+            
+            if index_data is None or index_data.empty:
+                self.logger.error("Failed to get index data for options chain subscription")
+                return
+                
+            current_price = index_data['close'].iloc[-1]
+            strike_step = 50  # NIFTY strike interval
+            atm_strike = int(round(current_price / strike_step) * strike_step)
+            
+            # Subscribe to ATM strikes (1 ITM, ATM, 1 OTM)
+            strikes = [atm_strike - strike_step, atm_strike, atm_strike + strike_step]
+            
+            # Subscribe to both CE and PE for each strike
+            for strike in strikes:
+                for option_type in ['CE', 'PE']:
+                    option_symbol = f"{symbol}{expiry_date.strftime('%d%m%y')}{strike}{option_type}"
+                    self.data_provider.subscribe_feeds(
+                        [
+                            {
+                                'stock_code': option_symbol,
+                                'exchange_code': 'NFO',
+                                'product_type': 'options',
+                                'strike_price': strike,
+                                'expiry_date': expiry_date.strftime('%Y-%m-%d'),
+                                'right': 'call' if option_type == 'CE' else 'put',
+                                'get_exchange_quotes': True
+                            }
+                        ],
+                        self._on_tick
+                    )
+                    self.logger.info(f"Subscribed to {option_symbol} for real-time updates")
+                    
+        except Exception as e:
+            self.logger.error(f"Error subscribing to options chain: {str(e)}", exc_info=True)
     
     def _initialize_new_candle(self, tick_time: datetime) -> None:
         """Initialize a new candle with the given timestamp."""
@@ -433,81 +497,106 @@ class TradingOrchestrator:
                 self.logger.error(f"Error stopping WebSocket: {str(e)}")
     
     def _on_tick(self, tick_data: Dict[str, Any]) -> None:
-        """Handle incoming real-time ticks and aggregate into 1-minute candles.
+        """Handle incoming real-time ticks and update strategy state.
         
         Args:
-            tick_data: Dictionary containing tick data with 'last' price and 'volume'
+            tick_data: Dictionary containing tick data with price, volume, etc.
         """
         try:
             tick_time = tick_data.get('datetime', datetime.now(self.ist_tz))
             if not isinstance(tick_time, datetime):
                 tick_time = datetime.fromisoformat(tick_time) if isinstance(tick_time, str) else datetime.now(self.ist_tz)
             
-            tick_price = float(tick_data.get('last', 0))
-            tick_volume = int(tick_data.get('volume', 0))
+            # Update last tick time
+            self._last_tick_time = tick_time
+            self._tick_count += 1
             
-            # Round to nearest minute for candle aggregation
-            candle_time = tick_time.replace(second=0, microsecond=0)
+            # Add tick to buffer
+            self._tick_buffer.append(tick_data)
             
-            # If new minute, finalize previous candle and create new one
-            if self.current_minute != candle_time:
-                self._process_completed_candle()
-                self.current_minute = candle_time
-                self.current_candle = {
-                    'open': tick_price,
-                    'high': tick_price,
-                    'low': tick_price,
-                    'close': tick_price,
-                    'volume': tick_volume,
-                    'datetime': candle_time,
-                    'symbol': self.config.get_trading_config().symbol,
-                    'interval': '1m'
-                }
-            else:
-                # Update current candle with tick data
-                if self.current_candle is None:
-                    self.current_candle = {
-                        'open': tick_price,
-                        'high': tick_price,
-                        'low': tick_price,
-                        'close': tick_price,
-                        'volume': tick_volume,
-                        'datetime': candle_time,
-                        'symbol': self.config.get_trading_config().symbol,
-                        'interval': '1m'
-                    }
+            # Process ticks in batches to reduce overhead
+            if len(self._tick_buffer) >= self._tick_window or \
+               (self._last_analysis_time is None or 
+                (tick_time - self._last_analysis_time).total_seconds() >= self._analysis_interval):
                 
-                self.current_candle['high'] = max(
-                    self.current_candle['high'] or tick_price, 
-                    tick_price
-                )
-                self.current_candle['low'] = min(
-                    self.current_candle['low'] or tick_price, 
-                    tick_price
-                )
-                self.current_candle['close'] = tick_price
-                self.current_candle['volume'] += tick_volume
+                self._process_tick_batch()
+                self._last_analysis_time = tick_time
             
-            # Store tick in buffer (useful for more granular analysis if needed)
-            self.ticks_buffer.append({
-                'datetime': tick_time,
-                'price': tick_price,
-                'volume': tick_volume
-            })
-            
-            # Process ticks in signal monitor if available
+            # Process the tick with the signal monitor if available
             if hasattr(self, 'signal_monitor') and self.signal_monitor and hasattr(self.signal_monitor, 'process_tick'):
                 self.signal_monitor.process_tick(tick_data)
                 
         except Exception as e:
             self.logger.error(f"Error processing tick {tick_data}: {str(e)}", exc_info=True)
+    
+    def _process_tick_batch(self) -> None:
+        """Process a batch of ticks from the buffer."""
+        if not self._tick_buffer:
+            return
+            
+        try:
+            # Process each tick in the buffer
+            for tick in self._tick_buffer:
+                self._update_strategy_with_tick(tick)
+                
+            # Clear the buffer after processing
+            self._tick_buffer.clear()
+            
+            # Run strategy analysis if needed
+            self._run_strategy_analysis()
+            
+        except Exception as e:
+            self.logger.error(f"Error processing tick batch: {str(e)}", exc_info=True)
+    
+    def _update_strategy_with_tick(self, tick_data: Dict[str, Any]) -> None:
+        """Update strategy state with the latest tick data."""
+        try:
+            symbol = tick_data.get('symbol')
+            if not symbol:
+                return
+                
+            # Update strategy's tick cache
+            if hasattr(self.strategy, '_tick_cache'):
+                self.strategy._tick_cache[symbol] = tick_data
+                
+            # Update strategy's candle cache if we have enough data
+            if hasattr(self.strategy, '_candle_cache') and self.data_provider:
+                candles = self.data_provider.get_latest_candles(symbol, num_candles=20)
+                if candles:
+                    self.strategy._candle_cache[symbol] = candles
+                    
+        except Exception as e:
+            self.logger.error(f"Error updating strategy with tick: {str(e)}", exc_info=True)
+    
+    def _run_strategy_analysis(self) -> None:
+        """Run strategy analysis on the latest market data."""
+        try:
+            # Check for exit conditions first
+            if self.trade_executor.has_open_positions():
+                for position in self.trade_executor.get_open_positions():
+                    if self.strategy.check_exit_conditions(position=position):
+                        self.trade_executor.close_position(position, reason="Exit condition met")
+            
+            # Then check for new entry opportunities
+            elif self.strategy.check_entry_conditions():
+                signal = self.strategy.generate_entry_signal()
+                if signal:
+                    self.trade_executor.execute_signal(signal)
+                    
+        except Exception as e:
+            self.logger.error(f"Error in strategy analysis: {str(e)}", exc_info=True)
+    
+    def _get_nearest_expiry(self) -> datetime:
+        """Get the nearest expiry date for options."""
+        today = datetime.now(self.ist_tz).date()
         
-        # Clear any stale signal history
-        self._signal_history.clear()
-        
-        # Reset the signal monitor
-        if hasattr(self, 'signal_monitor'):
-            self.signal_monitor.reset()
+        # Get next Thursday (NIFTY weekly expiry)
+        days_ahead = 3 - today.weekday()  # 3 = Thursday (0 = Monday)
+        if days_ahead <= 0:  # If today is Thursday or later, get next week's Thursday
+            days_ahead += 7
+            
+        next_thursday = today + timedelta(days=days_ahead)
+        return next_thursday
     
     def _on_market_close(self) -> None:
         """Handle market close event."""

@@ -34,7 +34,8 @@ class WebSocketHandler:
         """
         self.breeze = breeze_client
         self.logger = logger or logging.getLogger(__name__)
-        self.callbacks: Dict[str, List[DataCallback]] = {}
+        self.symbol_callbacks: Dict[str, List[DataCallback]] = {}
+        self.event_callbacks: Dict[str, List[DataCallback]] = {}
         self.subscribed_symbols: Set[str] = set()
         self.is_connected = False
         self._message_queue = Queue()
@@ -43,9 +44,52 @@ class WebSocketHandler:
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = 5
         self._reconnect_delay = 5  # seconds
+        self._lock = threading.Lock()
         
         # Register default callbacks
         self._register_default_callbacks()
+        
+    def register_callback(self, event_type: str, callback: DataCallback) -> None:
+        """Register a callback for a specific event type.
+        
+        Args:
+            event_type: Type of event to register for (e.g., 'tick', 'candle', 'error')
+            callback: Callback function to register
+        """
+        with self._lock:
+            if event_type not in self.event_callbacks:
+                self.event_callbacks[event_type] = []
+            if callback not in self.event_callbacks[event_type]:
+                self.event_callbacks[event_type].append(callback)
+                self.logger.debug(f"Registered callback for event type: {event_type}")
+                
+    def unregister_callback(self, event_type: str, callback: DataCallback) -> None:
+        """Unregister a callback for a specific event type.
+        
+        Args:
+            event_type: Type of event to unregister from
+            callback: Callback function to unregister
+        """
+        with self._lock:
+            if event_type in self.event_callbacks and callback in self.event_callbacks[event_type]:
+                self.event_callbacks[event_type].remove(callback)
+                self.logger.debug(f"Unregistered callback for event type: {event_type}")
+                
+    def _trigger_event(self, event_type: str, data: Any) -> None:
+        """Trigger all callbacks for a specific event type.
+        
+        Args:
+            event_type: Type of event to trigger
+            data: Data to pass to the callbacks
+        """
+        with self._lock:
+            callbacks = self.event_callbacks.get(event_type, []).copy()
+            
+        for callback in callbacks:
+            try:
+                callback(data)
+            except Exception as e:
+                self.logger.error(f"Error in {event_type} callback: {str(e)}", exc_info=True)
     
     def _register_default_callbacks(self) -> None:
         """Register default WebSocket event callbacks."""
@@ -112,31 +156,50 @@ class WebSocketHandler:
         self.is_connected = False
         self.logger.info("WebSocket disconnected")
     
-    def subscribe(self, symbols: List[str], callback: DataCallback) -> None:
+    def subscribe(self, symbols: List[Union[str, Dict[str, Any]]], callback: Optional[DataCallback] = None) -> None:
         """
         Subscribe to real-time updates for the given symbols.
         
         Args:
-            symbols: List of stock/option symbols to subscribe to
-            callback: Function to call when data is received
+            symbols: List of stock/option symbols or symbol configs to subscribe to
+            callback: Optional function to call when data is received for these symbols
         """
         if not symbols:
             return
             
-        # Add symbols to subscription list
-        new_symbols = set(symbols) - self.subscribed_symbols
-        if not new_symbols:
+        # Convert symbols to a consistent format
+        formatted_symbols = []
+        for symbol in symbols:
+            if isinstance(symbol, dict):
+                # Already in config format
+                stock_code = symbol.get('stock_code')
+                if not stock_code:
+                    continue
+                formatted_symbols.append((stock_code, symbol))
+            else:
+                # Simple symbol string
+                formatted_symbols.append((symbol, {'stock_code': symbol}))
+        
+        if not formatted_symbols:
             return
             
-        # Update subscribed symbols
-        self.subscribed_symbols.update(new_symbols)
+        # Add symbols to subscription list
+        new_symbols = []
+        with self._lock:
+            for symbol, symbol_config in formatted_symbols:
+                if symbol not in self.subscribed_symbols:
+                    new_symbols.append(symbol_config)
+                    self.subscribed_symbols.add(symbol)
+                    
+                # Register callback if provided
+                if callback is not None:
+                    if symbol not in self.symbol_callbacks:
+                        self.symbol_callbacks[symbol] = []
+                    if callback not in self.symbol_callbacks[symbol]:
+                        self.symbol_callbacks[symbol].append(callback)
         
-        # Register callback for each symbol
-        for symbol in new_symbols:
-            if symbol not in self.callbacks:
-                self.callbacks[symbol] = []
-            if callback not in self.callbacks[symbol]:
-                self.callbacks[symbol].append(callback)
+        if not new_symbols:
+            return
         
         # Subscribe to symbols via WebSocket
         if self.is_connected:
@@ -233,7 +296,27 @@ class WebSocketHandler:
     
     def _on_ticks(self, ticks: Dict[str, Any]) -> None:
         """Handle incoming tick data from WebSocket."""
-        self._message_queue.put(ticks)
+        try:
+            # Trigger tick event for general subscribers
+            self._trigger_event('tick', ticks)
+            
+            # Forward to message queue for processing
+            self._message_queue.put(ticks)
+            
+            # Extract symbol and forward to symbol-specific callbacks
+            symbol = ticks.get('symbol')
+            if symbol:
+                with self._lock:
+                    callbacks = self.symbol_callbacks.get(symbol, []).copy()
+                
+                for callback in callbacks:
+                    try:
+                        callback(ticks)
+                    except Exception as e:
+                        self.logger.error(f"Error in symbol callback for {symbol}: {str(e)}", exc_info=True)
+                        
+        except Exception as e:
+            self.logger.error(f"Error processing tick: {str(e)}", exc_info=True)
     
     def _on_connect(self) -> None:
         """Handle WebSocket connection established event."""
