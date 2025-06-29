@@ -5,6 +5,7 @@ Supports both real-time and historical data retrieval.
 import os
 import time
 import random
+import threading
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta

@@ -14,7 +14,7 @@ from dataclasses import asdict
 
 from core.models import (
     Order, OrderStatus, OrderType, Position, PositionStatus, 
-    TradeSignal, TradeSignalType, Portfolio, TradeError, RiskLimitExceededError,
+    TradeSignal, TradeSignalType, Portfolio, RiskLimitExceededError,
     InsufficientFundsError, InvalidSignalError
 )
 from core.config_manager import ConfigManager

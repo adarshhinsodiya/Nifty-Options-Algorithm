@@ -3,3 +3,5 @@
 /data/__pycache__
 /core/websocket/__pycache__
 /core/__pycache__
+/logs
+/strategies/__pycache__

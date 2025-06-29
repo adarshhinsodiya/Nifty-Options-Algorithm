@@ -6,6 +6,26 @@ from datetime import datetime
 from enum import Enum, auto
 from typing import Optional, List, Dict, Any
 
+
+class TradeError(Exception):
+    """Base exception for all trading-related errors."""
+    pass
+
+
+class RiskLimitExceededError(TradeError):
+    """Raised when a trade would exceed risk limits."""
+    pass
+
+
+class InsufficientFundsError(TradeError):
+    """Raised when there are insufficient funds for a trade."""
+    pass
+
+
+class InvalidSignalError(TradeError):
+    """Raised when an invalid trading signal is detected."""
+    pass
+
 class TradeSignalType(Enum):
     """Types of trading signals."""
     LONG = "LONG"
@@ -231,22 +251,112 @@ class Position:
         self.exit_reason = reason
         self.status = PositionStatus[reason.upper()] if hasattr(PositionStatus, reason.upper()) else PositionStatus.CLOSED
         self.calculate_pnl()
+        
+        # Move from open to closed positions if in a portfolio
+        if hasattr(self, 'portfolio'):
+            self.portfolio.positions.remove(self)
+            self.portfolio.closed_positions.append(self)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert position to dictionary."""
         return {
             'position_id': self.position_id,
-            'signal': self.signal.to_dict(),
-            'entry_order': self.entry_order.to_dict() if self.entry_order else None,
-            'exit_order': self.exit_order.to_dict() if self.exit_order else None,
+            'symbol': self.signal.symbol,
+            'signal_type': self.signal.signal_type.value,
+            'entry_price': self.entry_order.average_price,
+            'exit_price': self.exit_price,
+            'quantity': self.entry_order.quantity,
             'status': self.status.value,
             'entry_time': self.entry_time.isoformat(),
             'exit_time': self.exit_time.isoformat() if self.exit_time else None,
-            'exit_price': self.exit_price,
-            'exit_reason': self.exit_reason,
             'pnl': self.pnl,
-            'pnl_percentage': self.pnl_percentage
+            'pnl_percentage': self.pnl_percentage,
+            'exit_reason': self.exit_reason,
+            'signal': self.signal.to_dict()
         }
+
+
+@dataclass
+class Trade:
+    """Represents a completed trade with entry and exit details.
+    
+    This class combines the signal, entry order, and exit order into a single
+    trade object for reporting and analysis purposes.
+    """
+    symbol: str
+    signal: TradeSignal
+    entry_order: Order
+    trade_id: str = field(default_factory=lambda: f"trd_{int(datetime.utcnow().timestamp() * 1000)}")
+    exit_order: Optional[Order] = None
+    entry_time: datetime = field(default_factory=datetime.utcnow)
+    exit_time: Optional[datetime] = None
+    quantity: int = 1
+    entry_price: float = 0.0
+    exit_price: Optional[float] = None
+    pnl: Optional[float] = None
+    pnl_percentage: Optional[float] = None
+    status: str = "OPEN"
+    commission: float = 0.0
+    notes: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def __post_init__(self):
+        """Initialize trade with derived values."""
+        if self.entry_order:
+            self.entry_price = self.entry_order.average_price or self.entry_order.price
+            self.quantity = self.entry_order.quantity
+            self.entry_time = self.entry_order.filled_timestamp or self.entry_time
+        
+        if self.exit_order and self.exit_order.status == OrderStatus.COMPLETE:
+            self.exit_price = self.exit_order.average_price or self.exit_order.price
+            self.exit_time = self.exit_order.filled_timestamp or self.exit_time
+            self.calculate_pnl()
+    
+    def calculate_pnl(self) -> None:
+        """Calculate P&L for the trade."""
+        if self.exit_price is not None and self.entry_price > 0:
+            if self.signal.signal_type == TradeSignalType.LONG:
+                self.pnl = (self.exit_price - self.entry_price) * self.quantity
+            else:  # SHORT
+                self.pnl = (self.entry_price - self.exit_price) * self.quantity
+            
+            # Deduct commissions (assuming commission is total for the trade)
+            self.pnl -= self.commission
+            
+            # Calculate P&L percentage
+            self.pnl_percentage = (self.pnl / (self.entry_price * self.quantity)) * 100
+            self.status = "CLOSED"
+    
+    def close_trade(self, exit_order: Order, commission: float = 0.0) -> None:
+        """Close the trade with the given exit order."""
+        self.exit_order = exit_order
+        self.exit_price = exit_order.average_price or exit_order.price
+        self.exit_time = exit_order.filled_timestamp or datetime.utcnow()
+        self.commission += commission
+        self.calculate_pnl()
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert trade to dictionary."""
+        return {
+            'trade_id': self.trade_id,
+            'symbol': self.symbol,
+            'signal_type': self.signal.signal_type.value,
+            'entry_price': self.entry_price,
+            'exit_price': self.exit_price,
+            'quantity': self.quantity,
+            'pnl': self.pnl,
+            'pnl_percentage': self.pnl_percentage,
+            'status': self.status,
+            'entry_time': self.entry_time.isoformat(),
+            'exit_time': self.exit_time.isoformat() if self.exit_time else None,
+            'commission': self.commission,
+            'notes': self.notes,
+            'metadata': self.metadata,
+            'signal': self.signal.to_dict() if self.signal else None,
+            'entry_order': self.entry_order.to_dict() if self.entry_order else None,
+            'exit_order': self.exit_order.to_dict() if self.exit_order else None
+        }
+
 
 @dataclass
 class Portfolio:
