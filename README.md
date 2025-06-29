@@ -4,42 +4,56 @@ A sophisticated algorithmic trading system designed for trading NIFTY options wi
 
 ## 🌟 Key Features
 
-- **Multi-timeframe Analysis**: Supports multiple timeframes for comprehensive market analysis
-- **Robust Signal Generation**: Advanced pattern recognition with configurable parameters
-- **Risk Management**: Comprehensive risk controls including position sizing, stop losses, and daily loss limits
-- **Live Trading**: Seamless integration with ICICI Direct's Breeze API
-- **Backtesting Engine**: Historical simulation with detailed performance metrics
-- **Real-time Monitoring**: Live position tracking and performance dashboards
-- **Modular Architecture**: Clean separation of concerns for easy maintenance and extension
+### Trading Features
+- **Automated Trading**: Fully automated trading of NIFTY options
+- **Multiple Timeframes**: Support for various timeframes (1m, 5m, 15m, etc.)
+- **WebSocket Integration**: Real-time market data streaming
+- **Backtesting Engine**: Historical simulation with detailed analytics
+- **Paper Trading**: Risk-free trading with virtual funds
+
+### Risk Management
+- **Position Sizing**: Dynamic position sizing based on account balance
+- **Stop Loss/Take Profit**: Automated risk management
+- **Daily Loss Limits**: Prevent excessive drawdowns
+- **Overnight Position Control**: Automatic position management
+
+### Technical Features
+- **Modular Architecture**: Clean separation of concerns
+- **Strategy Interface**: Easy to implement custom strategies
+- **Real-time Monitoring**: Live tracking of positions and P&L
+- **Alert System**: Email/Telegram notifications for trades and alerts
+- **Logging**: Comprehensive logging for audit and debugging
 
 ## 🏗️ System Architecture
 
+The system follows a modular architecture with clear separation of concerns:
+
 ### Core Components
 
-1. **Main Application (`main.py`)**
-   - System entry point and lifecycle management
-   - Command-line interface and configuration loading
-   - Component initialization and coordination
+1. **Trading Engine (`orchestrator.py`)**
+   - Manages the trading lifecycle
+   - Coordinates between different components
+   - Handles strategy execution and order management
 
-2. **Core Modules (`core/`)**
-   - `models.py`: Data models (TradeSignal, Position, Order)
-   - `config_manager.py`: Configuration management
-   - `orchestrator.py`: Main trading logic and workflow
-   - `signal_monitor.py`: Real-time signal processing
-   - `data_provider.py`: Market data interface and API integration
+2. **Strategy Layer (`strategies/`)**
+   - Implements trading strategies
+   - Clean interface for strategy development
+   - Multiple strategy support
 
-3. **Execution Layer (`execution/`)**
-   - `trade_executor.py`: Order execution and management
-   - `position_manager.py`: Open position tracking
+3. **Data Layer (`data_provider.py`)**
+   - Market data acquisition
+   - WebSocket and REST API integration
+   - Historical and real-time data handling
 
-4. **Strategies (`strategies/`)**
-   - `candlestick_strategy.py`: Pattern-based trading strategy
+4. **Execution Layer (`execution/`)**
+   - Order placement and management
+   - Position tracking
+   - Risk management
 
-5. **Supporting Files**
-   - `config/`: Configuration files
-   - `data/`: Market data storage
-   - `docs/`: Documentation
-   - `tests/`: Unit and integration tests
+5. **Monitoring & Reporting**
+   - Real-time P&L tracking
+   - Trade logging
+   - Performance analytics
 
 ## Project Structure
 
@@ -47,22 +61,36 @@ A sophisticated algorithmic trading system designed for trading NIFTY options wi
 NIFTY-Options-Algorithm/
 ├── config/                    # Configuration files
 │   └── config.ini             # Main configuration file
-├── core/                      # Core business logic
-│   ├── models.py              # Data models and types
-│   ├── config_manager.py      # Configuration handling
+│
+├── core/                     # Core business logic
+│   ├── config_manager.py      # Configuration management
+│   ├── exceptions.py          # Custom exceptions
+│   ├── models.py              # Data models (TradeSignal, Position, etc.)
 │   ├── orchestrator.py        # Main trading workflow
-│   ├── signal_monitor.py      # Signal processing
-│   ├── data_provider.py       # Market data interface and API integration
-├── data/                      # Market data storage
-│   └── historical/            # Historical price data
-├── docs/                      # Documentation
-│   └── ITM_Options_Examples_Final.pdf  # Strategy examples
-├── execution/                 # Trade execution
-│   ├── trade_executor.py      # Order execution
-│   └── position_manager.py    # Position tracking
-├── strategies/                # Trading strategies
-│   └── candlestick_strategy.py # Pattern-based strategy
-├── tests/                     # Test cases
+│   ├── reporting.py           # Reporting and analytics
+│   ├── signal_monitor.py      # Real-time signal processing
+│   └── websocket/             # WebSocket implementation
+│       └── websocket_handler.py  # WebSocket handler for real-time data
+│
+├── data/                     # Market data
+│   └── data_provider.py       # Data provider interface and implementation
+│
+├── docs/                     # Documentation
+│   └── retry_logic.md         # Documentation on retry mechanisms
+│
+├── execution/                # Trade execution
+│   ├── position_manager.py    # Position tracking and management
+│   └── trade_executor.py      # Order execution logic
+│
+├── strategies/               # Trading strategies
+│   ├── base_strategy.py       # Abstract strategy class
+│   ├── candle_pattern.py      # Candle pattern strategy
+│   └── strategy_interface.txt  # Strategy interface documentation
+│
+├── tests/                    # Test cases
+│   └── test_retry.py          # Test cases for retry logic
+│
+├── ITM_Options_Examples_Final.pdf  # Example strategy document
 ├── main.py                    # Application entry point
 └── requirements.txt           # Python dependencies
 ```
@@ -138,11 +166,40 @@ python main.py --mode live
 - `--initial-capital`: Initial capital for backtesting
 - `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 
-## Strategy Overview
+## Strategy Implementation
 
-The trading strategy is based on 2-candle patterns with the following characteristics:
+### Strategy Interface
 
-### Long Signal (Bullish Engulfing with Confirmation)
+The system uses a clean interface for implementing trading strategies. Each strategy must implement the following methods:
+
+```python
+class BaseStrategy(ABC):
+    @abstractmethod
+    def check_entry_conditions(self, data: pd.DataFrame) -> bool:
+        """Check if entry conditions are met."""
+        pass
+    
+    @abstractmethod
+    def generate_entry_signal(self, data: pd.DataFrame) -> Optional[TradeSignal]:
+        """Generate entry signal if conditions are met."""
+        pass
+    
+    @abstractmethod
+    def check_exit_conditions(self, data: pd.DataFrame, position: TradeSignal) -> bool:
+        """Check if exit conditions are met."""
+        pass
+    
+    @abstractmethod
+    def generate_exit_signal(self, data: pd.DataFrame, position: TradeSignal) -> Optional[TradeSignal]:
+        """Generate exit signal if conditions are met."""
+        pass
+```
+
+### Candle Pattern Strategy
+
+The default strategy is based on candlestick patterns with the following characteristics:
+
+#### Long Signal (Bullish Engulfing with Confirmation)
 1. Previous candle is bearish (close < open)
 2. Upper wick is larger than the body
 3. Upper wick is larger than the lower wick
@@ -150,7 +207,7 @@ The trading strategy is based on 2-candle patterns with the following characteri
 5. Current candle closes above previous open
 6. Current candle is bullish (close > open)
 
-### Short Signal (Bearish Engulfing with Confirmation)
+#### Short Signal (Bearish Engulfing with Confirmation)
 1. Previous candle is bullish (close > open)
 2. Lower wick is larger than the body
 3. Lower wick is larger than the upper wick
@@ -163,6 +220,13 @@ The trading strategy is based on 2-candle patterns with the following characteri
 - **Stop Loss**: Based on ATR (Average True Range)
 - **Take Profit**: 1.5x risk-reward ratio
 - **Exit**: At stop-loss, take-profit, or end of day
+- **Overnight Positions**: Automatically closed before market close if not holding overnight
+
+### Real-time Features
+- WebSocket integration for live market data
+- Real-time position monitoring
+- Automatic position sizing based on account balance
+- Email/Telegram alerts for trade signals and important events
 
 ## 🤝 Contributing
 
