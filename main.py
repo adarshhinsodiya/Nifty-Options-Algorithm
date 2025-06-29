@@ -28,8 +28,8 @@ def parse_arguments():
         '--mode', 
         type=str, 
         choices=['live', 'backtest'], 
-        default='backtest',
-        help='Operation mode: live trading or backtesting (default: backtest)'
+        default='live',
+        help='Operation mode: live trading or backtesting (default: live)'
     )
     
     parser.add_argument(

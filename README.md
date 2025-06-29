@@ -17,36 +17,55 @@ A sophisticated algorithmic trading system designed for trading NIFTY options wi
 ### Core Components
 
 1. **Main Application (`main.py`)**
-   - Entry point for the trading system
-   - Manages system lifecycle and component initialization
-   - Handles command-line arguments and configuration
-   - Coordinates between different system components
+   - System entry point and lifecycle management
+   - Command-line interface and configuration loading
+   - Component initialization and coordination
 
 2. **Core Modules (`core/`)**
-   - `models.py`: Data models (TradeSignal, Position, etc.)
+   - `models.py`: Data models (TradeSignal, Position, Order)
    - `config_manager.py`: Configuration management
-   - `signal_monitor.py`: Real-time signal processing and queue management
-   - `orchestrator.py`: Main trading logic and workflow orchestration
+   - `orchestrator.py`: Main trading logic and workflow
+   - `signal_monitor.py`: Real-time signal processing
+   - `data_provider.py`: Market data interface and API integration
 
 3. **Execution Layer (`execution/`)**
-   - `trade_executor.py`: Handles order execution and position management
-   - `position_manager.py`: Monitors and manages open positions
-   - `risk_manager.py`: Implements risk management rules
+   - `trade_executor.py`: Order execution and management
+   - `position_manager.py`: Open position tracking
 
-4. **Data Layer**
-   - `data_provider.py`: Abstract interface for market data
-   - `breeze_data.py`: ICICI Direct Breeze API integration
-   - `historical_data.py`: Historical data management
+4. **Strategies (`strategies/`)**
+   - `candlestick_strategy.py`: Pattern-based trading strategy
 
-5. **Strategies (`strategies/`)**
-   - `base_strategy.py`: Abstract base class for trading strategies
-   - `candlestick_strategy.py`: Candlestick pattern-based strategy
-   - `mean_reversion.py`: Mean reversion strategy
+5. **Supporting Files**
+   - `config/`: Configuration files
+   - `data/`: Market data storage
+   - `docs/`: Documentation
+   - `tests/`: Unit and integration tests
 
-6. **Utilities (`utils/`)**
-   - `logger.py`: Custom logging configuration
-   - `helpers.py`: Common utility functions
-   - `performance.py`: Performance metrics and analysis
+## Project Structure
+
+```
+NIFTY-Options-Algorithm/
+├── config/                    # Configuration files
+│   └── config.ini             # Main configuration file
+├── core/                      # Core business logic
+│   ├── models.py              # Data models and types
+│   ├── config_manager.py      # Configuration handling
+│   ├── orchestrator.py        # Main trading workflow
+│   ├── signal_monitor.py      # Signal processing
+│   ├── data_provider.py       # Market data interface and API integration
+├── data/                      # Market data storage
+│   └── historical/            # Historical price data
+├── docs/                      # Documentation
+│   └── ITM_Options_Examples_Final.pdf  # Strategy examples
+├── execution/                 # Trade execution
+│   ├── trade_executor.py      # Order execution
+│   └── position_manager.py    # Position tracking
+├── strategies/                # Trading strategies
+│   └── candlestick_strategy.py # Pattern-based strategy
+├── tests/                     # Test cases
+├── main.py                    # Application entry point
+└── requirements.txt           # Python dependencies
+```
 
 ## 🚀 Getting Started
 
@@ -145,37 +164,6 @@ The trading strategy is based on 2-candle patterns with the following characteri
 - **Take Profit**: 1.5x risk-reward ratio
 - **Exit**: At stop-loss, take-profit, or end of day
 
-## Project Structure
-
-```
-NIFTY-Options-Trading-System/
-├── config/                    # Configuration files
-│   └── config.ini             # Main configuration file
-├── core/                      # Core functionality
-│   ├── config_manager.py      # Configuration management
-│   ├── models.py              # Data models
-│   ├── orchestrator.py        # Trading orchestrator
-│   └── signal_monitor.py      # Signal processing
-├── data/                      # Market data
-│   ├── historical/            # Historical price data
-│   └── signals/               # Generated signals
-├── execution/                 # Trade execution
-│   ├── position_manager.py    # Position management
-│   ├── risk_manager.py        # Risk management
-│   └── trade_executor.py      # Order execution
-├── strategies/                # Trading strategies
-│   ├── base_strategy.py       # Base strategy class
-│   ├── candlestick_strategy.py # Pattern-based strategy
-│   └── mean_reversion.py      # Mean reversion strategy
-├── tests/                     # Unit tests
-├── utils/                     # Utility functions
-│   ├── helpers.py             # Helper functions
-│   ├── logger.py              # Logging configuration
-│   └── performance.py         # Performance metrics
-├── main.py                    # Main application
-└── requirements.txt           # Python dependencies
-```
-
 ## 🤝 Contributing
 
 1. Fork the repository
@@ -225,7 +213,7 @@ python main.py --mode backtest --start-date 2023-01-01 --end-date 2023-12-31
 ### Available Command-line Arguments
 
 ```
---mode           Operation mode (live/backtest)
+--mode           Operation mode (live/backtest) [default: live]
 --config         Path to config file
 --symbol         Trading symbol (overrides config)
 --quantity       Position size (overrides config)
@@ -288,37 +276,3 @@ The system implements multiple layers of risk controls:
    - Maximum daily loss limit
    - Maximum drawdown limit
    - Position concentration limits
-
-## 📚 Documentation
-
-### Key Classes
-
-#### TradeSignal
-Represents a trading signal with all necessary attributes for execution.
-
-**Key Attributes:**
-- `signal_type`: BUY/SELL
-- `entry_price`: Entry price
-- `stop_loss`: Stop loss price
-- `take_profit`: Take profit price
-- `symbol`: Trading symbol
-- `quantity`: Position size
-- `timestamp`: Signal generation time
-
-#### TradeExecutor
-Handles order execution and position management.
-
-**Key Methods:**
-- `execute_signal()`: Process a trading signal
-- `place_order()`: Place an order with the broker
-- `cancel_order()`: Cancel an open order
-- `get_position()`: Get current position for a symbol
-
-#### PositionManager
-Monitors and manages open positions.
-
-**Key Features:**
-- Real-time P&L tracking
-- Stop-loss monitoring
-- Position adjustment
-- Risk limit enforcement
