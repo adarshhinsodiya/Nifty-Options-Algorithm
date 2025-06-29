@@ -6,10 +6,11 @@ for the NIFTY Options Trading System, specifically for live trading mode.
 """
 import json
 import logging
+import random
 import time
 import threading
 from queue import Queue, Empty
-from typing import Dict, List, Optional, Callable, Any, Set
+from typing import Dict, List, Optional, Callable, Any, Set, Union
 from datetime import datetime
 import pytz
 
@@ -52,6 +53,8 @@ class WebSocketHandler:
         self._connection_timeout = 30  # Consider connection dead after 30s of inactivity
         self._heartbeat_interval = 10  # Send heartbeat every 10s
         self._last_heartbeat = time.time()
+        self._tick_count = 0  # Initialize tick counter
+        self._shutdown_event = threading.Event()  # For graceful shutdown
         
         # Register default callbacks
         self._register_default_callbacks()
@@ -362,9 +365,7 @@ class WebSocketHandler:
                 time.sleep(5)  # Avoid tight loop on errors
         
         self.logger.info("WebSocket connection monitor stopped")
-    
-    def _process_messages(self) -> None:
-        """Process messages from the WebSocket in a separate thread."""
+        
         while not self._stop_event.is_set():
             try:
                 # Process all available messages with a small timeout
@@ -384,26 +385,29 @@ class WebSocketHandler:
     
     def _handle_message(self, message: Dict[str, Any]) -> None:
         """
-        Handle incoming WebSocket message.
+        Handle incoming WebSocket message and dispatch to callbacks.
         
         Args:
             message: The WebSocket message data
         """
         try:
-            # Extract symbol from message
-            symbol = message.get('symbol')
-            if not symbol or symbol not in self.callbacks:
-                return
-            
-            # Call all registered callbacks for this symbol
-            for callback in self.callbacks.get(symbol, []):
-                try:
-                    callback(message)
-                except Exception as e:
-                    self.logger.error(f"Error in WebSocket callback: {str(e)}", exc_info=True)
-                    
+            if 'tick' in message:
+                self._on_ticks(message['tick'])
+            elif 'connected' in message:
+                self._on_connect()
+            elif 'disconnected' in message:
+                self._on_disconnect()
+            elif 'error' in message:
+                self._on_error(message['error'])
+            elif 'heartbeat' in message:
+                self._handle_heartbeat()
         except Exception as e:
-            self.logger.error(f"Error handling WebSocket message: {str(e)}", exc_info=True)
+            self.logger.error(f"Error processing message: {str(e)}", exc_info=True)
+            self._trigger_event('error', {
+                'error': 'message_processing_error',
+                'message': str(e),
+                'original_message': str(message)[:500]  # Truncate if too large
+            })
     
     def _on_ticks(self, ticks: Dict[str, Any]) -> None:
         """Handle incoming tick data from WebSocket with validation and error handling."""
@@ -568,6 +572,29 @@ class WebSocketHandler:
         # Start reconnection in a separate thread
         threading.Thread(target=reconnect, daemon=True, name=f"WebSocketReconnect-{self._reconnect_attempts}").start()
     
-    def __del__(self):
-        """Clean up resources on object deletion."""
+    def close(self) -> None:
+        """Clean up resources and stop all threads."""
+        self.logger.info("Closing WebSocket handler...")
+        self._shutdown_event.set()
         self.disconnect()
+        
+        # Wait for threads to complete
+        if self._processing_thread and self._processing_thread.is_alive():
+            self._processing_thread.join(timeout=5.0)
+            
+        if self._connection_monitor_thread and self._connection_monitor_thread.is_alive():
+            self._connection_monitor_thread.join(timeout=5.0)
+    
+    def __enter__(self):
+        """Context manager entry."""
+        self.connect()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - ensure resources are cleaned up."""
+        self.close()
+    
+    def __del__(self):
+        """Fallback cleanup on garbage collection."""
+        if not self._shutdown_event.is_set():
+            self.close()
