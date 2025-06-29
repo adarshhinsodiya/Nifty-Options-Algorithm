@@ -9,7 +9,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import pytz
-from typing import Dict, List, Optional, Tuple, Union, Callable, Any, TypeVar, Type
+from typing import Dict, List, Optional, Tuple, Union, Callable, Any, TypeVar, Type, Set
 import logging
 import json
 from pathlib import Path
@@ -17,6 +17,7 @@ from functools import wraps
 
 from core.config_manager import ConfigManager
 from core.models import TradeSignal, TradeSignalType
+from core.websocket.websocket_handler import WebSocketHandler
 
 # Type variable for generic function return type
 T = TypeVar('T')
@@ -57,6 +58,10 @@ class DataProvider:
         self._initial_backoff = 1  # seconds
         self._max_backoff = 30  # seconds
         
+        # WebSocket related attributes
+        self._websocket_handler = None
+        self._active_subscriptions = set()  # Track active subscriptions
+        
         if self.mode == 'live':
             self._initialize_breeze_api()
     
@@ -66,7 +71,7 @@ class DataProvider:
         return logger
     
     def _initialize_breeze_api(self) -> None:
-        """Initialize ICICI Direct Breeze API connection."""
+        """Initialize ICICI Direct Breeze API connection and WebSocket."""
         try:
             from breeze_connect import BreezeConnect
             
@@ -81,12 +86,158 @@ class DataProvider:
                 self._session_token = api_creds['session_token']
                 self._renew_session()
                 
+                # Initialize WebSocket handler
+                self._initialize_websocket()
+                
         except ImportError:
             self.logger.error("breeze-connect package not installed. Install with: pip install breeze-connect")
             raise
         except Exception as e:
             self.logger.error(f"Failed to initialize Breeze API: {str(e)}")
             raise
+    
+    def _initialize_websocket(self) -> None:
+        """Initialize the WebSocket handler for real-time data."""
+        if not self.breeze:
+            raise APIError("Breeze API not initialized")
+            
+        try:
+            self._websocket_handler = WebSocketHandler(self.breeze, self.logger)
+            self.logger.info("WebSocket handler initialized")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize WebSocket handler: {str(e)}")
+            raise
+    
+    def subscribe_realtime_data(
+        self, 
+        symbols: List[str], 
+        callback: Callable[[Dict[str, Any]], None],
+        exchange_code: str = 'NSE',
+        product_type: str = 'cash',
+        expiry_date: str = '',
+        strike_price: str = '',
+        right: str = ''
+    ) -> None:
+        """
+        Subscribe to real-time market data for the given symbols.
+        
+        Args:
+            symbols: List of stock/option symbols to subscribe to
+            callback: Function to call when data is received
+            exchange_code: Exchange code (NSE/NFO)
+            product_type: Product type ('cash', 'futures', 'options')
+            expiry_date: Expiry date for derivatives (format: 'DD-MM-YYYY')
+            strike_price: Strike price for options
+            right: 'call' or 'put' for options
+        """
+        if not self._websocket_handler:
+            self.logger.error("WebSocket handler not initialized")
+            return
+            
+        try:
+            # Format symbols for WebSocket subscription
+            formatted_symbols = []
+            for symbol in symbols:
+                # Create a unique key for this subscription
+                sub_key = f"{exchange_code}:{symbol}:{product_type}"
+                if product_type == 'options':
+                    sub_key += f":{expiry_date}:{strike_price}:{right}"
+                
+                # Add to active subscriptions if not already subscribed
+                if sub_key not in self._active_subscriptions:
+                    formatted_symbols.append({
+                        'exchange_code': exchange_code,
+                        'stock_code': symbol,
+                        'product_type': product_type,
+                        'expiry_date': expiry_date,
+                        'strike_price': strike_price,
+                        'right': right
+                    })
+                    self._active_subscriptions.add(sub_key)
+            
+            if not formatted_symbols:
+                self.logger.debug("No new symbols to subscribe to")
+                return
+                
+            # Subscribe to symbols via WebSocket
+            self._websocket_handler.subscribe(formatted_symbols, callback)
+            self.logger.info(f"Subscribed to {len(formatted_symbols)} symbols for real-time updates")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to subscribe to real-time data: {str(e)}")
+            raise
+    
+    def unsubscribe_realtime_data(self, symbols: List[str], callback: Callable = None) -> None:
+        """
+        Unsubscribe from real-time market data for the given symbols.
+        
+        Args:
+            symbols: List of stock/option symbols to unsubscribe from
+            callback: Specific callback to remove (if None, removes all callbacks for the symbol)
+        """
+        if not self._websocket_handler:
+            return
+            
+        try:
+            # Format symbols for WebSocket unsubscription
+            formatted_symbols = []
+            for symbol in symbols:
+                # Find all matching subscription keys
+                matching_keys = [k for k in self._active_subscriptions if k.startswith(f":{symbol}:")]
+                for key in matching_keys:
+                    # Parse the key to get subscription details
+                    parts = key.split(':')
+                    if len(parts) >= 3:
+                        exchange_code = parts[0]
+                        stock_code = parts[1]
+                        product_type = parts[2]
+                        
+                        formatted_symbols.append({
+                            'exchange_code': exchange_code,
+                            'stock_code': stock_code,
+                            'product_type': product_type
+                        })
+                        
+                        # Remove from active subscriptions
+                        self._active_subscriptions.discard(key)
+            
+            if not formatted_symbols:
+                self.logger.debug("No active subscriptions found for the given symbols")
+                return
+                
+            # Unsubscribe from symbols via WebSocket
+            self._websocket_handler.unsubscribe(formatted_symbols, callback)
+            self.logger.info(f"Unsubscribed from {len(formatted_symbols)} symbols")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to unsubscribe from real-time data: {str(e)}")
+            raise
+    
+    def start_websocket(self) -> None:
+        """Start the WebSocket connection for real-time data."""
+        if not self._websocket_handler:
+            self.logger.error("WebSocket handler not initialized")
+            return
+            
+        try:
+            if not self._websocket_handler.is_connected:
+                self._websocket_handler.connect()
+                self.logger.info("WebSocket connection started")
+        except Exception as e:
+            self.logger.error(f"Failed to start WebSocket: {str(e)}")
+            raise
+    
+    def stop_websocket(self) -> None:
+        """Stop the WebSocket connection."""
+        if not self._websocket_handler:
+            return
+            
+        try:
+            if self._websocket_handler.is_connected:
+                self._websocket_handler.disconnect()
+                self.logger.info("WebSocket connection stopped")
+        except Exception as e:
+            self.logger.error(f"Error stopping WebSocket: {str(e)}")
     
     def _is_session_valid(self) -> bool:
         """Check if the current session is valid and not expired."""
@@ -98,7 +249,7 @@ class DataProvider:
         return datetime.now(pytz.utc) < (self._session_expiry - buffer)
     
     def _renew_session(self) -> None:
-        """Renew the Breeze API session token."""
+        """Renew the Breeze API session token and reconnect WebSocket if needed."""
         if not self._session_token or not self._api_secret:
             self.logger.error("Cannot renew session: Missing session token or API secret")
             return
@@ -114,16 +265,22 @@ class DataProvider:
             self._session_expiry = datetime.now(pytz.utc) + timedelta(hours=23, minutes=55)
             self.logger.info(f"Session renewed successfully. Expires at {self._session_expiry.astimezone(self.ist_tz)}")
             
-            # Reconnect WebSocket if needed
-            if hasattr(self.breeze, 'ws_connect'):
+            # Reconnect WebSocket if it was connected
+            if hasattr(self, '_websocket_handler') and self._websocket_handler and self._websocket_handler.is_connected:
                 try:
-                    self.breeze.ws_connect()
+                    self._websocket_handler.disconnect()
+                    self._websocket_handler.connect()
+                    self.logger.info("WebSocket reconnected after session renewal")
                 except Exception as e:
-                    self.logger.warning(f"Failed to reconnect WebSocket: {str(e)}")
+                    self.logger.warning(f"Failed to reconnect WebSocket after session renewal: {str(e)}")
                     
         except Exception as e:
             self.logger.error(f"Failed to renew session: {str(e)}")
             raise SessionExpiredError("Failed to renew Breeze API session") from e
+    
+    def __del__(self):
+        """Clean up resources on object deletion."""
+        self.stop_websocket()
     
     def _ensure_valid_session(self) -> None:
         """Ensure we have a valid session, renewing if necessary."""

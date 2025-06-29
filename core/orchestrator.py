@@ -199,6 +199,9 @@ class TradingOrchestrator:
             self.current_candle = None
             self.ticks_buffer = []
             
+            # Start WebSocket for real-time data
+            self._start_websocket()
+            
             # Start the signal monitor
             self.signal_monitor.start()
             
@@ -375,10 +378,10 @@ class TradingOrchestrator:
     
     def _process_completed_candle(self) -> None:
         """Process the completed candle and check for signals."""
-        if not self.current_candle or 'close' not in self.current_candle:
-            return
-            
         try:
+            if not self.current_candle or 'close' not in self.current_candle:
+                return
+                
             # Log the completed candle
             self.logger.debug(
                 f"Completed 1m candle: {self.current_candle['datetime']} | "
@@ -395,39 +398,84 @@ class TradingOrchestrator:
             self.metrics['last_error'] = str(e)
             self.logger.error(f"Error processing completed candle: {str(e)}", exc_info=True)
     
-    def _on_tick(self, ticks: List[Dict[str, Any]]) -> None:
+    def _start_websocket(self) -> None:
+        """Initialize and start WebSocket for real-time data."""
+        if self.mode != 'live' or not hasattr(self.data_provider, 'start_websocket'):
+            return
+            
+        try:
+            # Subscribe to required symbols
+            symbols = self.config.get_trading_config().get('symbols', ['NIFTY', 'BANKNIFTY'])
+            
+            # Start WebSocket connection
+            self.data_provider.start_websocket()
+            
+            # Subscribe to real-time data with callback
+            self.data_provider.subscribe_realtime_data(
+                symbols=symbols,
+                callback=self._on_tick,
+                exchange_code='NSE',
+                product_type='cash'  # For index data
+            )
+            
+            self.logger.info(f"WebSocket started and subscribed to {len(symbols)} symbols")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to start WebSocket: {str(e)}", exc_info=True)
+    
+    def _stop_websocket(self) -> None:
+        """Stop WebSocket connection."""
+        if hasattr(self.data_provider, 'stop_websocket'):
+            try:
+                self.data_provider.stop_websocket()
+                self.logger.info("WebSocket connection stopped")
+            except Exception as e:
+                self.logger.error(f"Error stopping WebSocket: {str(e)}")
+    
+    def _on_tick(self, tick_data: Dict[str, Any]) -> None:
         """Handle incoming real-time ticks and aggregate into 1-minute candles.
         
         Args:
-            ticks: List of tick data dictionaries with 'last' price and 'volume'
+            tick_data: Dictionary containing tick data with 'last' price and 'volume'
         """
-        if not ticks:
-            return
+        try:
+            tick_time = tick_data.get('datetime', datetime.now(self.ist_tz))
+            if not isinstance(tick_time, datetime):
+                tick_time = datetime.fromisoformat(tick_time) if isinstance(tick_time, str) else datetime.now(self.ist_tz)
             
-        for tick in ticks:
-            try:
-                tick_time = tick.get('datetime', datetime.now(self.ist_tz))
-                if not isinstance(tick_time, datetime):
-                    tick_time = datetime.fromisoformat(tick_time) if isinstance(tick_time, str) else datetime.now(self.ist_tz)
-                
-                tick_price = float(tick.get('last', 0))
-                tick_volume = int(tick.get('volume', 0))
-                
-                # Initialize first candle if needed
-                if self.current_candle is None:
-                    self._initialize_new_candle(tick_time)
-                
-                # Check if we've moved to a new minute
-                current_minute = tick_time.replace(second=0, microsecond=0)
-                if current_minute > self.current_minute:
-                    # Process the completed candle
-                    self._process_completed_candle()
-                    # Start a new candle
-                    self._initialize_new_candle(tick_time)
-                
+            tick_price = float(tick_data.get('last', 0))
+            tick_volume = int(tick_data.get('volume', 0))
+            
+            # Round to nearest minute for candle aggregation
+            candle_time = tick_time.replace(second=0, microsecond=0)
+            
+            # If new minute, finalize previous candle and create new one
+            if self.current_minute != candle_time:
+                self._process_completed_candle()
+                self.current_minute = candle_time
+                self.current_candle = {
+                    'open': tick_price,
+                    'high': tick_price,
+                    'low': tick_price,
+                    'close': tick_price,
+                    'volume': tick_volume,
+                    'datetime': candle_time,
+                    'symbol': self.config.get_trading_config().symbol,
+                    'interval': '1m'
+                }
+            else:
                 # Update current candle with tick data
-                if self.current_candle['open'] is None:
-                    self.current_candle['open'] = tick_price
+                if self.current_candle is None:
+                    self.current_candle = {
+                        'open': tick_price,
+                        'high': tick_price,
+                        'low': tick_price,
+                        'close': tick_price,
+                        'volume': tick_volume,
+                        'datetime': candle_time,
+                        'symbol': self.config.get_trading_config().symbol,
+                        'interval': '1m'
+                    }
                 
                 self.current_candle['high'] = max(
                     self.current_candle['high'] or tick_price, 
@@ -439,34 +487,20 @@ class TradingOrchestrator:
                 )
                 self.current_candle['close'] = tick_price
                 self.current_candle['volume'] += tick_volume
-                
-                # Store tick in buffer (useful for more granular analysis if needed)
-                self.ticks_buffer.append({
-                    'datetime': tick_time,
-                    'price': tick_price,
-                    'volume': tick_volume
-                })
-                
-            except Exception as e:
-                self.logger.error(f"Error processing tick {tick}: {str(e)}", exc_info=True)
-    
-    def _on_market_open(self) -> None:
-        """Handle market open event."""
-        self.logger.info("Market is now open")
-        self._prepare_for_trading_day()
-        
-        # Initialize signal history if it doesn't exist
-        if not hasattr(self, '_signal_history'):
-            self._signal_history = {}
             
-        # Reset daily metrics
-        self.metrics.update({
-            'signals_processed': 0,
-            'signals_failed': 0,
-            'api_errors': 0,
-            'last_error': None,
-            'last_signal_time': None
-        })
+            # Store tick in buffer (useful for more granular analysis if needed)
+            self.ticks_buffer.append({
+                'datetime': tick_time,
+                'price': tick_price,
+                'volume': tick_volume
+            })
+            
+            # Process ticks in signal monitor if available
+            if hasattr(self, 'signal_monitor') and self.signal_monitor and hasattr(self.signal_monitor, 'process_tick'):
+                self.signal_monitor.process_tick(tick_data)
+                
+        except Exception as e:
+            self.logger.error(f"Error processing tick {tick_data}: {str(e)}", exc_info=True)
         
         # Clear any stale signal history
         self._signal_history.clear()
@@ -531,6 +565,9 @@ class TradingOrchestrator:
             # Stop the signal monitor
             if hasattr(self, 'signal_monitor') and self.signal_monitor:
                 self.signal_monitor.shutdown()
+            
+            # Close WebSocket connection
+            self._stop_websocket()
             
             # Close any open positions if market is still open
             if self.market_open:
