@@ -5,3 +5,4 @@
 /core/__pycache__
 /logs
 /strategies/__pycache__
+/.env
