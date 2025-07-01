@@ -98,10 +98,37 @@ NIFTY-Options-Algorithm/
 ## 🚀 Getting Started
 
 ### Prerequisites
-
 - Python 3.8+
-- ICICI Direct Breeze API credentials (for live trading)
-- Required Python packages (see `requirements.txt`)
+- ICICI Direct Breeze API credentials
+- Virtual environment (recommended)
+
+### Environment Setup
+
+1. **Install Dependencies**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. **Set Up Environment Variables**
+   - Copy the example environment file:
+     ```bash
+     cp .env.example .env
+     ```
+   - Edit the `.env` file and add your ICICI Direct Breeze API credentials:
+     ```
+     # Required
+     BREEZE_API_KEY=your_api_key_here
+     BREEZE_API_SECRET=your_api_secret_here
+     
+     # Optional
+     BREEZE_SESSION_TOKEN=your_session_token_here  # Can be generated if not provided
+     BREEZE_API_URL=https://api.icicidirect.com/breezeapi/api/v2/
+     ```
+
+   - **Security Note**: Never commit your `.env` file to version control. It's already included in `.gitignore`.
+
+3. **Generate Session Token (if needed)**
+   If you don't have a session token, the system can generate one for you on first run.
 
 ### Installation
 

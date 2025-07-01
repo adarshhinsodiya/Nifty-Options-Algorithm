@@ -1,12 +1,16 @@
 """
 Configuration manager for the trading system.
-Handles loading and validating configuration from INI files.
+Handles loading configuration from INI files and environment variables.
 """
 import os
 import configparser
 from pathlib import Path
 from typing import Dict, Any, Optional
 from dataclasses import dataclass
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 @dataclass
 class TradingConfig:
@@ -43,6 +47,13 @@ class SignalConfig:
     atr_period: int
     atr_multiplier: float
 
+@dataclass
+class RiskConfig:
+    """Risk management configuration."""
+    max_position_size: float
+    max_portfolio_risk: float
+    max_daily_loss_pct: float
+
 class ConfigManager:
     """Manages configuration loading and validation."""
     
@@ -60,7 +71,7 @@ class ConfigManager:
         self.config.read(self.config_path)
         
         # Validate required sections
-        required_sections = ['general', 'api', 'trading', 'backtest', 'options', 'signals']
+        required_sections = ['general', 'api', 'trading', 'backtest', 'options', 'signals', 'risk']
         for section in required_sections:
             if section not in self.config:
                 raise ValueError(f"Missing required section in config: {section}")
@@ -105,13 +116,28 @@ class ConfigManager:
         )
     
     def get_api_credentials(self) -> Dict[str, str]:
-        """Get API credentials."""
-        return {
-            'api_key': self.config.get('api', 'api_key'),
-            'api_secret': self.config.get('api', 'api_secret'),
-            'session_token': self.config.get('api', 'session_token'),
-            'api_url': self.config.get('api', 'api_url')
+        """Get API credentials from environment variables.
+        
+        Returns:
+            Dict containing API credentials with default values if not set.
+            
+        Raises:
+            ValueError: If required API credentials are missing from environment.
+        """
+        credentials = {
+            'api_key': os.getenv('BREEZE_API_KEY'),
+            'api_secret': os.getenv('BREEZE_API_SECRET'),
+            'session_token': os.getenv('BREEZE_SESSION_TOKEN'),
+            'api_url': os.getenv('BREEZE_API_URL', 'https://api.icicidirect.com/breezeapi/api/v2/')
         }
+        
+        # Check for required credentials
+        if not credentials['api_key'] or not credentials['api_secret']:
+            raise ValueError(
+                "Missing required API credentials. Please set BREEZE_API_KEY and BREEZE_API_SECRET "
+                "in your .env file or environment variables.")
+                
+        return credentials
     
     def get_logging_config(self) -> Dict[str, str]:
         """Get logging configuration."""
@@ -121,3 +147,19 @@ class ConfigManager:
             'log_rotation': self.config.get('general', 'log_rotation'),
             'log_retention': self.config.get('general', 'log_retention')
         }
+    
+    def get_risk_config(self) -> RiskConfig:
+        """Get risk management configuration."""
+        return RiskConfig(
+            max_position_size=self.config.getfloat('risk', 'max_position_size'),
+            max_portfolio_risk=self.config.getfloat('risk', 'max_portfolio_risk'),
+            max_daily_loss_pct=self.config.getfloat('risk', 'max_daily_loss_pct')
+        )
+        
+    def get_timezone(self):
+        """Get the timezone from configuration.
+        
+        Returns:
+            str: Timezone string (default: 'Asia/Kolkata')
+        """
+        return self.config.get('general', 'timezone', fallback='Asia/Kolkata')

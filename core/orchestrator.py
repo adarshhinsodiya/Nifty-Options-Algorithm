@@ -6,6 +6,7 @@ import logging
 import time
 import json
 import os
+from collections import deque
 from datetime import datetime, time, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 import pandas as pd
@@ -628,6 +629,16 @@ class TradingOrchestrator:
         Returns:
             Dict containing system health status
         """
+        # Get recent signals if signal monitor is available
+        recent_signals = []
+        if hasattr(self, 'signal_monitor') and self.signal_monitor is not None:
+            if hasattr(self.signal_monitor, 'get_recent_signals'):
+                recent_signals = self.signal_monitor.get_recent_signals(hours=24) or []
+        
+        # Get unique symbols from recent signals
+        active_symbols = list({s['symbol'] for s in recent_signals if hasattr(s, 'symbol')} | 
+                             {s.symbol for s in recent_signals if hasattr(s, 'symbol')})
+        
         status = {
             'timestamp': datetime.now(self.ist_tz).isoformat(),
             'market_status': 'open' if self.market_open else 'closed',
@@ -637,8 +648,8 @@ class TradingOrchestrator:
             'last_error': self.metrics['last_error'],
             'uptime_minutes': round((datetime.now(self.ist_tz) - self.metrics['start_time']).total_seconds() / 60, 1),
             'last_signal': self.metrics['last_signal_time'].isoformat() if self.metrics['last_signal_time'] else None,
-            'signal_queue_size': len(self.signal_monitor.get_queued_signals()) if hasattr(self, 'signal_monitor') else 0,
-            'active_symbols': list(set(s.symbol for s in self.signal_monitor.get_queued_signals())) if hasattr(self, 'signal_monitor') else []
+            'recent_signals_count': len(recent_signals),
+            'active_symbols': active_symbols
         }
         
         # Log health status
@@ -809,6 +820,13 @@ class TradingOrchestrator:
         Returns:
             Dict containing signal processing statistics
         """
+        # Safely get recent signals count if signal_monitor exists and has the method
+        recent_signals_count = 0
+        if hasattr(self, 'signal_monitor') and self.signal_monitor is not None:
+            if hasattr(self.signal_monitor, 'get_recent_signals'):
+                recent_signals = self.signal_monitor.get_recent_signals(hours=24)
+                recent_signals_count = len(recent_signals) if recent_signals else 0
+        
         return {
             'signals_processed': self.metrics['signals_processed'],
             'signals_failed': self.metrics['signals_failed'],
@@ -817,7 +835,7 @@ class TradingOrchestrator:
             'uptime_minutes': round((datetime.now(self.ist_tz) - self.metrics['start_time']).total_seconds() / 60, 1),
             'last_signal_time': self.metrics['last_signal_time'].isoformat() 
                              if self.metrics['last_signal_time'] else None,
-            'queue_size': len(self.signal_monitor.get_queued_signals()) if hasattr(self, 'signal_monitor') else 0
+            'recent_signals_count': recent_signals_count
         }
     
     def _get_previous_candle(self, current_time: datetime) -> Optional[Dict[str, Any]]:
@@ -973,17 +991,22 @@ class TradingOrchestrator:
         try:
             # Stop the signal monitor if in live mode
             if self.mode == 'live' and hasattr(self, 'signal_monitor') and self.signal_monitor:
-                self.signal_monitor.shutdown()
+                if hasattr(self.signal_monitor, 'shutdown'):
+                    self.signal_monitor.shutdown()
             
             # Close any open positions if market is open
             if hasattr(self, 'trade_executor') and self.trade_executor:
                 if self.mode == 'live' and hasattr(self, 'market_open') and self.market_open:
                     self.logger.info("Closing all open positions...")
-                self.trade_executor.square_off_all_positions()
+                if hasattr(self.trade_executor, 'square_off_all_positions'):
+                    self.trade_executor.square_off_all_positions()
             
-            # Close data provider connection
+            # Close data provider connection if it has a disconnect method
             if hasattr(self, 'data_provider') and self.data_provider:
-                self.data_provider.disconnect()
+                if hasattr(self.data_provider, 'disconnect'):
+                    self.data_provider.disconnect()
+                elif hasattr(self.data_provider, 'close'):
+                    self.data_provider.close()
             
             # Log final metrics if available
             if hasattr(self, 'metrics'):

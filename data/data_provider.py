@@ -66,8 +66,16 @@ class DataProvider:
         self._candle_store = {}  # Store 1-minute candles by symbol
         self._tick_lock = threading.Lock()  # Thread lock for tick store access
         
-        if self.mode == 'live':
+        # Initialize Breeze API for both live and backtest modes
+        try:
             self._initialize_breeze_api()
+            if self.mode == 'live':
+                self._initialize_websocket()
+        except Exception as e:
+            self.logger.error(f"Failed to initialize Breeze API: {str(e)}")
+            if self.mode == 'live':
+                raise  # In live mode, fail fast if API initialization fails
+            # In backtest mode, we'll try to continue but historical data will fail
     
     def _setup_logger(self) -> logging.Logger:
         """Set up logger for the data provider."""
@@ -75,29 +83,41 @@ class DataProvider:
         return logger
     
     def _initialize_breeze_api(self) -> None:
-        """Initialize ICICI Direct Breeze API connection and WebSocket."""
+        """Initialize ICICI Direct Breeze API connection."""
         try:
             from breeze_connect import BreezeConnect
             
             api_creds = self.config.get_api_credentials()
+            if not api_creds.get('api_key'):
+                raise ValueError("API key not found in configuration")
+                
             self.breeze = BreezeConnect(api_key=api_creds['api_key'])
             self._api_secret = api_creds.get('api_secret')
             
+            # Set the API URL if provided
+            if api_creds.get('api_url'):
+                self.breeze.root_url = api_creds['api_url']
+            
             # Generate session token if not provided
             if not api_creds.get('session_token'):
-                self.logger.warning("Session token not provided. Generate one using generate_session()")
+                if self.mode == 'live':
+                    self.logger.warning("Session token not provided. Live trading requires a valid session token.")
+                else:
+                    self.logger.warning("Session token not provided. Backtesting with public data only.")
             else:
                 self._session_token = api_creds['session_token']
                 self._renew_session()
                 
-                # Initialize WebSocket handler
-                self._initialize_websocket()
-                
-        except ImportError:
-            self.logger.error("breeze-connect package not installed. Install with: pip install breeze-connect")
-            raise
+        except ImportError as e:
+            error_msg = "breeze-connect package not installed. Install with: pip install breeze-connect"
+            self.logger.error(error_msg)
+            if self.mode == 'live':
+                raise ImportError(error_msg) from e
         except Exception as e:
-            self.logger.error(f"Failed to initialize Breeze API: {str(e)}")
+            error_msg = f"Failed to initialize Breeze API: {str(e)}"
+            self.logger.error(error_msg)
+            if self.mode == 'live':
+                raise APIError(error_msg) from e
             raise
     
     def _initialize_websocket(self) -> None:
@@ -514,95 +534,54 @@ class DataProvider:
         Returns:
             DataFrame with OHLCV data
         """
-        try:
-            if self.mode == 'backtest':
-                # For backtesting, try to load from file first
-                file_path = f"data/historical/{symbol}_{interval}.csv"
-                if os.path.exists(file_path):
-                    df = pd.read_csv(file_path, parse_dates=['date'])
-                    df.set_index('date', inplace=True)
-                    return df
-                
-                # If file doesn't exist, fetch from API
-                if not self.breeze:
-                    self.logger.error("Breeze API not initialized")
-                    return pd.DataFrame()
-                
-                data = self.breeze.get_historical_data_v2(
-                    from_date=from_date.strftime('%Y-%m-%dT%H:%M:%S.000Z'),
-                    to_date=to_date.strftime('%Y-%m-%dT%H:%M:%S.000Z'),
-                    stock_code=symbol,
-                    exchange_code=exchange_code,
-                    product_type=product_type,
-                    interval=interval
-                )
-                
-                if not data or 'Success' not in data:
-                    self.logger.error(f"Failed to fetch historical data: {data}")
-                    return pd.DataFrame()
-                
-                df = pd.DataFrame(data['Success'])
-                
-                # Convert and rename columns
-                df['date'] = pd.to_datetime(df['datetime'])
-                df.rename(columns={
-                    'open': 'open',
-                    'high': 'high',
-                    'low': 'low',
-                    'close': 'close',
-                    'volume': 'volume'
-                }, inplace=True)
-                
-                # Set index and sort
-                df.set_index('date', inplace=True)
-                df.sort_index(inplace=True)
-                
-                # Save to file for future use
-                os.makedirs(os.path.dirname(file_path), exist_ok=True)
-                df.to_csv(file_path)
-                
-                return df
-                
-            else:  # Live mode
-                if not self.breeze:
-                    self.logger.error("Breeze API not initialized")
-                    return pd.DataFrame()
-                
-                data = self.breeze.get_historical_data_v2(
-                    from_date=from_date.strftime('%Y-%m-%dT%H:%M:%S.000Z'),
-                    to_date=to_date.strftime('%Y-%m-%dT%H:%M:%S.000Z'),
-                    stock_code=symbol,
-                    exchange_code=exchange_code,
-                    product_type=product_type,
-                    interval=interval
-                )
-                
-                if not data or 'Success' not in data:
-                    self.logger.error(f"Failed to fetch historical data: {data}")
-                    return pd.DataFrame()
-                
-                df = pd.DataFrame(data['Success'])
-                
-                # Convert and rename columns
-                df['date'] = pd.to_datetime(df['datetime'])
-                df.rename(columns={
-                    'open': 'open',
-                    'high': 'high',
-                    'low': 'low',
-                    'close': 'close',
-                    'volume': 'volume'
-                }, inplace=True)
-                
-                # Set index and sort
-                df.set_index('date', inplace=True)
-                df.sort_index(inplace=True)
-                
-                return df
-                
-        except Exception as e:
-            self.logger.error(f"Error fetching historical data: {str(e)}")
+        if not self.breeze:
+            self.logger.error("Breeze API not initialized. Check your API credentials in the .env file")
+            self.logger.info("Please ensure you have set BREEZE_API_KEY and BREEZE_API_SECRET in your .env file")
             return pd.DataFrame()
-    
+            
+        try:
+            result = self._api_call_with_retry(
+                self._get_historical_data_impl,
+                symbol=symbol,
+                from_date=from_date,
+                to_date=to_date,
+                interval=interval,
+                exchange_code=exchange_code,
+                product_type=product_type
+            )
+            
+            if not result or 'Success' not in result or not result['Success']:
+                error_msg = result.get('Error', 'Unknown error') if isinstance(result, dict) else 'Invalid response format'
+                self.logger.error(f"Failed to fetch historical data: {error_msg}")
+                return pd.DataFrame()
+                
+            # Convert to DataFrame and standardize column names
+            df = pd.DataFrame(result['Success'])
+            if df.empty:
+                self.logger.warning(f"No data returned for {symbol} from {from_date} to {to_date}")
+                return df
+                
+            # Convert string dates to datetime
+            df['date'] = pd.to_datetime(df['datetime'])
+            df.rename(columns={
+                'open': 'open',
+                'high': 'high',
+                'low': 'low',
+                'close': 'close',
+                'volume': 'volume'
+            }, inplace=True)
+            
+            # Set index and sort
+            df.set_index('date', inplace=True)
+            df.sort_index(inplace=True)
+            
+            self.logger.info(f"Successfully fetched {len(df)} candles for {symbol} from {df.index[0]} to {df.index[-1]}")
+            return df
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching historical data: {str(e)}", exc_info=True)
+            return pd.DataFrame()
+            
     def _get_option_chain_impl(
         self,
         expiry_date: datetime,

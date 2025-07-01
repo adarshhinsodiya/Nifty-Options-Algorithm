@@ -60,19 +60,19 @@ class TradeExecutor:
         self.current_date = datetime.now(self.ist_tz).date()
         self.daily_trades_count = 0
         self.daily_pnl = 0.0
-        self.max_daily_trades = self.trading_config.get('max_daily_trades', 10)
+        self.max_daily_trades = self.trading_config.max_daily_trades
         
         # Risk management
-        self.max_position_size = self.risk_config.get('max_position_size', 0.1)  # 10% of portfolio
-        self.max_portfolio_risk = self.risk_config.get('max_portfolio_risk', 0.02)  # 2% risk per trade
-        self.max_daily_loss_pct = self.risk_config.get('max_daily_loss_pct', 0.05)  # 5% daily loss limit
+        self.max_position_size = self.risk_config.max_position_size  # 10% of portfolio
+        self.max_portfolio_risk = self.risk_config.max_portfolio_risk  # 2% risk per trade
+        self.max_daily_loss_pct = self.risk_config.max_daily_loss_pct  # 5% daily loss limit
         self.initial_balance = self.portfolio.current_cash
         
         # Signal cooldown tracking
         self.last_signal_time: Dict[str, datetime] = {}
-        self.signal_cooldown = timedelta(
-            minutes=self.trading_config.get('signal_cooldown_minutes', 5)
-        )
+        # Default signal cooldown to 5 minutes if not specified
+        signal_cooldown_minutes = getattr(self.trading_config, 'signal_cooldown_minutes', 5)
+        self.signal_cooldown = timedelta(minutes=signal_cooldown_minutes)
         
         # Position tracking
         self.open_positions: Dict[str, Position] = {}
@@ -931,6 +931,51 @@ class TradeExecutor:
         #     return False
                 
         return True
+        
+    def square_off_all_positions(self) -> None:
+        """Close all open positions.
+        
+        This method is called during system shutdown to ensure all positions are closed.
+        It will attempt to close all open positions at market price.
+        """
+        if not self.open_positions:
+            self.logger.info("No open positions to square off")
+            return
+            
+        self.logger.info(f"Squaring off {len(self.open_positions)} open positions...")
+        
+        # Create a list of positions to avoid modifying the dict during iteration
+        positions_to_close = list(self.open_positions.values())
+        
+        for position in positions_to_close:
+            try:
+                # Determine if we need to buy or sell to close the position
+                action = OrderType.SELL if position.quantity > 0 else OrderType.BUY
+                quantity = abs(position.quantity)
+                
+                # Get current market price for the symbol
+                symbol = position.symbol
+                current_price = self.data_provider.get_market_price(symbol)
+                
+                if current_price is None:
+                    self.logger.warning(f"Could not get market price for {symbol}, using position's entry price")
+                    current_price = position.entry_price
+                
+                # Place market order to close the position
+                self.place_order(
+                    symbol=symbol,
+                    order_type=OrderType.MARKET,
+                    quantity=quantity,
+                    action=action,
+                    tag=f"SquareOff_{position.position_id}"
+                )
+                
+                self.logger.info(f"Closed position {position.position_id} for {symbol} x {quantity} @ {current_price}")
+                
+            except Exception as e:
+                self.logger.error(f"Error closing position {position.position_id}: {str(e)}", exc_info=True)
+        
+        self.logger.info("Finished squaring off positions")
             
     def _get_commission_rate(self) -> float:
         """Get the commission rate from backtest config.
