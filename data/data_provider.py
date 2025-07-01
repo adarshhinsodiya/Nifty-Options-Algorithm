@@ -15,7 +15,7 @@ import logging
 import json
 from pathlib import Path
 from functools import wraps
-
+from breeze_connect import BreezeConnect
 from core.config_manager import ConfigManager
 from core.models import TradeSignal, TradeSignalType
 from core.websocket.websocket_handler import WebSocketHandler
@@ -83,31 +83,75 @@ class DataProvider:
         return logger
     
     def _initialize_breeze_api(self) -> None:
-        """Initialize ICICI Direct Breeze API connection."""
+        """Initialize the Breeze API client."""
         try:
-            from breeze_connect import BreezeConnect
+            self.logger.info("Initializing Breeze API...")
             
-            api_creds = self.config.get_api_credentials()
-            if not api_creds.get('api_key'):
-                raise ValueError("API key not found in configuration")
+            # Get API credentials
+            credentials = self.config.get_api_credentials()
+            
+            # Log credentials (masking sensitive info)
+            creds_to_log = credentials.copy()
+            if 'api_key' in creds_to_log:
+                creds_to_log['api_key'] = creds_to_log['api_key'][:4] + '...' + creds_to_log['api_key'][-4:]
+            if 'api_secret' in creds_to_log:
+                creds_to_log['api_secret'] = '***' + creds_to_log['api_secret'][-4:]
+            if 'session_token' in creds_to_log and creds_to_log['session_token']:
+                creds_to_log['session_token'] = creds_to_log['session_token'][:4] + '...' + creds_to_log['session_token'][-4:]
                 
-            self.breeze = BreezeConnect(api_key=api_creds['api_key'])
-            self._api_secret = api_creds.get('api_secret')
+            self.logger.info(f"Using credentials: {creds_to_log}")
             
-            # Set the API URL if provided
-            if api_creds.get('api_url'):
-                self.breeze.root_url = api_creds['api_url']
+            # Verify required credentials
+            if not credentials.get('api_key'):
+                raise ValueError("Missing Breeze API key")
+            if not credentials.get('api_secret'):
+                raise ValueError("Missing Breeze API secret")
             
-            # Generate session token if not provided
-            if not api_creds.get('session_token'):
-                if self.mode == 'live':
-                    self.logger.warning("Session token not provided. Live trading requires a valid session token.")
-                else:
-                    self.logger.warning("Session token not provided. Backtesting with public data only.")
+            # Initialize Breeze API client
+            self.logger.info("Creating BreezeConnect instance...")
+            self.breeze = BreezeConnect(api_key=credentials['api_key'])
+            
+            # Set the session token if available
+            if credentials.get('session_token'):
+                self.logger.info("Generating session with provided token...")
+                try:
+                    session_response = self.breeze.generate_session(
+                        api_secret=credentials['api_secret'],
+                        session_token=credentials['session_token']
+                    )
+                    self.logger.info(f"Session response: {session_response}")
+                    
+                    # Test the session with a simple API call
+                    self.logger.info("Testing session with get_customer_details...")
+                    customer_details = self.breeze.get_customer_details()
+                    self.logger.info(f"Customer details: {customer_details}")
+                    
+                    if customer_details is None:
+                        self.logger.error("Failed to get customer details. Session may be invalid.")
+                    
+                except Exception as session_error:
+                    self.logger.error(f"Error generating session: {str(session_error)}", exc_info=True)
+                    raise ValueError("Invalid session token or API secret") from session_error
             else:
-                self._session_token = api_creds['session_token']
-                self._renew_session()
+                self.logger.warning("No session token provided. You'll need to generate one.")
+                if self.mode == 'live':
+                    self.logger.warning("Live trading requires a valid session token.")
                 
+                # In backtest mode, we can try to generate a new session
+                if self.mode == 'backtest' and credentials.get('api_secret'):
+                    self.logger.info("Attempting to generate new session for backtesting...")
+                    try:
+                        session_response = self.breeze.generate_session(api_secret=credentials['api_secret'])
+                        self.logger.info(f"New session generated: {session_response}")
+                        
+                        # Test the new session
+                        customer_details = self.breeze.get_customer_details()
+                        self.logger.info(f"Customer details with new session: {customer_details}")
+                        
+                    except Exception as auth_error:
+                        self.logger.error(f"Failed to generate new session: {str(auth_error)}")
+                        self.logger.warning("Continuing with limited functionality")
+        
         except ImportError as e:
             error_msg = "breeze-connect package not installed. Install with: pip install breeze-connect"
             self.logger.error(error_msg)
@@ -387,43 +431,19 @@ class DataProvider:
         return datetime.now(pytz.utc) < (self._session_expiry - buffer)
     
     def _renew_session(self) -> None:
-        """Renew the Breeze API session token and reconnect WebSocket if needed."""
-        if not self._session_token or not self._api_secret:
-            self.logger.error("Cannot renew session: Missing session token or API secret")
-            return
-            
-        try:
-            self.logger.info("Renewing Breeze API session...")
-            self.breeze.generate_session(
-                api_secret=self._api_secret,
-                session_token=self._session_token
-            )
-            
-            # Update session expiry (Breeze sessions typically last 24 hours)
-            self._session_expiry = datetime.now(pytz.utc) + timedelta(hours=23, minutes=55)
-            self.logger.info(f"Session renewed successfully. Expires at {self._session_expiry.astimezone(self.ist_tz)}")
-            
-            # Reconnect WebSocket if it was connected
-            if hasattr(self, '_websocket_handler') and self._websocket_handler and self._websocket_handler.is_connected:
-                try:
-                    self._websocket_handler.disconnect()
-                    self._websocket_handler.connect()
-                    self.logger.info("WebSocket reconnected after session renewal")
-                except Exception as e:
-                    self.logger.warning(f"Failed to reconnect WebSocket after session renewal: {str(e)}")
-                    
-        except Exception as e:
-            self.logger.error(f"Failed to renew session: {str(e)}")
-            raise SessionExpiredError("Failed to renew Breeze API session") from e
+        """Session renewal is disabled. Using initial session token only."""
+        self.logger.warning("Session renewal is disabled. Using initial session token.")
+        return
     
-    def __del__(self):
-        """Clean up resources on object deletion."""
-        self.stop_websocket()
     
     def _ensure_valid_session(self) -> None:
-        """Ensure we have a valid session, renewing if necessary."""
+        """Check if the Breeze API session is valid."""
+        if not self._session_token:
+            raise SessionExpiredError("No session token available")
+            
+        # Just log a warning if session appears expired but continue anyway
         if not self._is_session_valid():
-            self._renew_session()
+            self.logger.warning("Session appears expired but continuing with current token")
     
     def _api_call_with_retry(self, func: Callable[..., T], *args, **kwargs) -> T:
         """Execute an API call with retry logic and session management.
@@ -486,32 +506,68 @@ class DataProvider:
             raise last_exception
         raise APIError(f"API call failed: {str(last_exception)}") from last_exception
     
-    def _get_historical_data_impl(
-        self,
-        symbol: str,
-        from_date: datetime,
-        to_date: datetime,
-        interval: str = '1minute',
-        exchange_code: str = 'NSE',
-        product_type: str = 'cash'
-    ) -> Dict:
-        """Internal implementation of get_historical_data without retry logic."""
-        if not self.breeze:
-            raise APIError("Breeze API not initialized")
+    def _get_historical_data_impl(self, symbol: str, from_date: datetime, to_date: datetime,
+                               interval: str = '1minute', exchange_code: str = 'NSE',
+                               product_type: str = 'cash') -> Dict:
+        """Implementation of historical data fetch with retry logic."""
+        try:
+            # Format dates as required by Breeze API
+            from_str = from_date.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+            to_str = to_date.strftime('%Y-%m-%dT%H:%M:%S.000Z')
             
-        # Format dates as strings in the required format
-        from_str = from_date.strftime('%Y-%m-%dT%H:%M:%S')
-        to_str = to_date.strftime('%Y-%m-%dT%H:%M:%S')
+            self.logger.info(f"Fetching historical data for {symbol} from {from_str} to {to_str}")
+            self.logger.info(f"Exchange: {exchange_code}, Product: {product_type}, Interval: {interval}")
+            
+            # Log the exact request being made
+            request_data = {
+                'interval': interval,
+                'from_date': from_str,
+                'to_date': to_str,
+                'stock_code': symbol,
+                'exchange_code': exchange_code,
+                'product_type': product_type
+            }
+            self.logger.info(f"API Request: {request_data}")
+            
+            try:
+                # Make the API call
+                result = self.breeze.get_historical_data(**request_data)
+                
+                if result is None:
+                    self.logger.error("API returned None response. This usually indicates an authentication issue.")
+                    # Try to get more detailed error information
+                    try:
+                        # Try a simple API call to check authentication
+                        test = self.breeze.get_customer_details()
+                        self.logger.info(f"Test API call response: {test}")
+                        
+                        # Check if we can get any data with a simpler request
+                        test_data = self.breeze.get_historical_data(
+                            interval='1day',
+                            from_date='2024-01-01T00:00:00.000Z',
+                            to_date='2024-01-02T00:00:00.000Z',
+                            stock_code='NIFTY',
+                            exchange_code='NSE',
+                            product_type='cash'
+                        )
+                        self.logger.info(f"Test data response: {test_data}")
+                        
+                    except Exception as auth_error:
+                        self.logger.error(f"Authentication check failed: {str(auth_error)}", exc_info=True)
+                
+                self.logger.info(f"Raw API response type: {type(result)}")
+                self.logger.info(f"Raw API response: {result}")
+                return result if result is not None else {}
+                
+            except Exception as e:
+                self.logger.error(f"Error in Breeze API call: {str(e)}", exc_info=True)
+                raise
+            
+        except Exception as e:
+            self.logger.error(f"Error in _get_historical_data_impl: {str(e)}", exc_info=True)
+            raise  # Re-raise the exception to be handled by the caller
+            
         
-        return self.breeze.get_historical_data(
-            interval=interval,
-            from_date=from_str,
-            to_date=to_str,
-            stock_code=symbol,
-            exchange_code=exchange_code,
-            product_type=product_type
-        )
-    
     def get_historical_data(
         self,
         symbol: str,
@@ -540,15 +596,56 @@ class DataProvider:
             return pd.DataFrame()
             
         try:
-            result = self._api_call_with_retry(
-                self._get_historical_data_impl,
-                symbol=symbol,
-                from_date=from_date,
-                to_date=to_date,
-                interval=interval,
-                exchange_code=exchange_code,
-                product_type=product_type
-            )
+            # First try with NSE/cash (index data)
+            try:
+                self.logger.info("Attempting to fetch NIFTY index data (NSE/cash)")
+                result = self._api_call_with_retry(
+                    self._get_historical_data_impl,
+                    symbol='NIFTY',
+                    from_date=from_date,
+                    to_date=to_date,
+                    interval=interval,
+                    exchange_code='NSE',
+                    product_type='cash'
+                )
+                
+                if not result or not isinstance(result, dict) or not result.get('Success', False):
+                    error_msg = result.get('Error', 'Unknown error') if isinstance(result, dict) else 'Invalid response format'
+                    self.logger.warning(f"Failed to fetch NIFTY index data: {error_msg}")
+                    raise APIError(f"Failed to fetch NIFTY index data: {error_msg}")
+                    
+            except Exception as e:
+                self.logger.warning(f"Error fetching NIFTY index data: {str(e)}")
+                
+                # Fall back to NFO/options if NSE/cash fails
+                try:
+                    self.logger.info("Falling back to NIFTY options data (NFO/options)")
+                    result = self._api_call_with_retry(
+                        self._get_historical_data_impl,
+                        symbol='NIFTY',
+                        from_date=from_date,
+                        to_date=to_date,
+                        interval=interval,
+                        exchange_code='NFO',
+                        product_type='options'
+                    )
+                    
+                    if not result or not isinstance(result, dict) or not result.get('Success', False):
+                        error_msg = result.get('Error', 'Unknown error') if isinstance(result, dict) else 'Invalid response format'
+                        self.logger.error(f"Failed to fetch NIFTY options data: {error_msg}")
+                        raise APIError(f"Failed to fetch NIFTY options data: {error_msg}")
+                        
+                except Exception as options_error:
+                    self.logger.error(f"Error fetching NIFTY options data: {str(options_error)}")
+                    raise APIError(f"All data fetch attempts failed. Last error: {str(options_error)}")
+            
+            self.logger.info(f"API call completed. Response type: {type(result)}")
+            if result is None:
+                self.logger.error("API returned None response")
+            elif isinstance(result, dict):
+                self.logger.info(f"API response keys: {result.keys()}")
+            else:
+                self.logger.info(f"API response length: {len(result) if hasattr(result, '__len__') else 'N/A'}")
             
             if not result or 'Success' not in result or not result['Success']:
                 error_msg = result.get('Error', 'Unknown error') if isinstance(result, dict) else 'Invalid response format'
