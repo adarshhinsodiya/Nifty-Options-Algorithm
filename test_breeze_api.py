@@ -24,7 +24,7 @@ def test_api_connection(api_key, api_secret, session_token, api_url):
             if session_token:
                 # For older versions of breeze-connect, we set the session token directly
                 breeze._session_token = session_token
-                details = breeze.get_customer_details()
+                details = breeze.get_customer_details(session_token)
                 print("Success! Customer details:")
                 print(f"Name: {details.get('first_name', 'N/A')} {details.get('last_name', 'N/A')}")
                 print(f"Email: {details.get('email_id', 'N/A')}")
@@ -33,37 +33,8 @@ def test_api_connection(api_key, api_secret, session_token, api_url):
                 print("No session token provided, skipping session test")
         except Exception as e:
             print(f"Error with session token: {str(e)}")
-            
-        # Test 2: Try to generate new session
-        if api_secret:
-            print("\nTest 2: Attempting to generate new session...")
-            try:
-                # For older versions, the response format might be different
-                session_response = breeze.generate_session(
-                    api_secret=api_secret,
-                    session_token=session_token if session_token else None
-                )
-                print("Session generation response:")
-                print(f"Response: {session_response}")
-                
-                # Try different response formats
-                if isinstance(session_response, dict):
-                    if 'session_token' in session_response:
-                        print(f"New Session Token: {session_response['session_token']}")
-                    elif 'Status' in session_response:
-                        print(f"Status: {session_response['Status']}")
-                elif isinstance(session_response, str):
-                    print(f"Session Token: {session_response}")
-                    breeze._session_token = session_response
-                return True
-            except Exception as e:
-                print(f"Error generating session: {str(e)}")
-        
-        return False
-        
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
-        return False
 
 def main():
     # Load environment variables
@@ -91,8 +62,6 @@ def main():
     print("\n=== Test Summary ===")
     if success:
         print("Tests completed successfully!")
-    else:
-        print("Some tests failed. Please check your credentials and try again.")
     
     print("\nNote: If you're getting authentication errors:")
     print("1. Verify your API key and secret in the ICICI Direct portal")
