@@ -469,7 +469,7 @@ class TradingOrchestrator:
             
         try:
             # Subscribe to required symbols
-            symbols = self.config.get_trading_config().get('symbols', ['NIFTY', 'BANKNIFTY'])
+            symbols = self.config.get_trading_config().get('symbols', ['NIFTY'])
             
             # Start WebSocket connection
             self.data_provider.start_websocket()
