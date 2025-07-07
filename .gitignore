@@ -1,8 +1,1 @@
-/venv
-/execution/__pycache__
-/data/__pycache__
-/core/websocket/__pycache__
-/core/__pycache__
-/logs
-/strategies/__pycache__
 /.env
