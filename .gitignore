@@ -1,1 +1,6 @@
 /.env
+trading_bot_project/
+logs/
+data/
+/icici_option.py
+/bot_dhan.py

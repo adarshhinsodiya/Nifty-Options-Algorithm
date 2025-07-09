@@ -53,6 +53,8 @@ class SimpleTradingBot:
         self.candle_buffer = deque(maxlen=20) # Increased maxlen for more historical data if needed for ATR/other indicators
         self.current_minute = None # Will store the minute part of the exchange_timestamp
         self.minute_candle = {'open': None, 'high': -np.inf, 'low': np.inf, 'close': None}
+        self.last_candle_time = None
+        self.current_candle = None
         self.spot_price = None
         self.call_strike = None
         self.put_strike = None
@@ -65,10 +67,6 @@ class SimpleTradingBot:
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 5
         self.last_minute_log_time = None # To track last time minute data was logged (local time)
-
-        # New: Store latest options data
-        self.call_option_data = {'ltp': None, 'bid': None, 'ask': None}
-        self.put_option_data = {'ltp': None, 'bid': None, 'ask': None}
 
         # Validate configuration
         self._validate_config()
@@ -177,92 +175,9 @@ class SimpleTradingBot:
         if not self.spot_price or self.spot_price <= 0:
             logger.warning("Invalid or missing NIFTY spot price.")
             return False
-
-        # # --- Check 3: Is the CALL option LTP available and valid? ---
-        # if 'ltp' not in self.call_option_data or self.call_option_data['ltp'] is None:
-        #     logger.warning("Call option LTP not available.")
-        #     return False
-
-        # # --- Check 4: Is the PUT option LTP available and valid? ---
-        # if 'ltp' not in self.put_option_data or self.put_option_data['ltp'] is None:
-        #     logger.warning("Put option LTP not available.")
-        #     return False
-
-        # ✅ All conditions passed — trading is safe to proceed
+        
+        # All conditions passed — trading is safe to proceed
         return True
-
-
-    def _are_option_prices_ready(self):
-        """
-        Checks whether both CALL and PUT option LTPs (Last Traded Prices)
-        are available and valid.
-
-        This function ensures that the bot does not proceed with trading logic
-        (like signal evaluation or position sizing) unless both option feeds
-        have been successfully subscribed and received their first live tick.
-
-        Returns:
-            bool: True if both CALL and PUT option LTPs are available (not None), else False
-        """
-
-        return (
-            # Check if CALL option's LTP has been received and is not None
-            self.call_option_data.get("ltp") is not None and
-
-            # Check if PUT option's LTP has been received and is not None
-            self.put_option_data.get("ltp") is not None
-        )
-
-
-    def _calculate_position_size(self, option_ltp):
-        """
-        Calculates the number of option lots (position size) to trade based on:
-        - Risk capital per trade (defined as a percentage of total capital)
-        - Current option premium (LTP)
-        - Lot size (contract size per lot)
-
-        This risk-based position sizing method ensures that the bot does not risk
-        more than a fixed percentage of the capital on any single trade.
-
-        Formula:
-            risk_amount = capital × risk_percent
-            cost_per_lot = option_ltp × lot_size
-            position_size = floor(risk_amount / cost_per_lot)
-
-        Parameters:
-            option_ltp (float): Current LTP (price) of the option to be traded
-
-        Returns:
-            int: Number of lots to trade (0 if insufficient capital or invalid input)
-        """
-
-        try:
-            # --- Step 1: Validate option price ---
-            if not option_ltp or option_ltp <= 0:
-                logger.warning(f"Invalid option LTP for sizing: {option_ltp}")
-                return 0
-
-            # --- Step 2: Calculate capital risked per trade (fixed % of total capital) ---
-            risk_amount = self.capital * self.risk_pct / 100
-
-            # --- Step 3: Calculate how much one lot of the option costs ---
-            cost_per_lot = option_ltp * self.lot_size
-
-            # --- Step 4: Determine how many such lots we can buy within risk limit ---
-            position_size = int(risk_amount // cost_per_lot)  # Floor division to get whole lots
-
-            # --- Step 5: Handle edge case where size is too small to afford 1 lot ---
-            if position_size <= 0:
-                logger.warning("Insufficient capital for even one lot at current LTP.")
-                return 0
-
-            # ✅ Valid position size calculated
-            return position_size
-
-        except Exception as e:
-            # Catch and log any unexpected errors (e.g. missing attributes)
-            logger.error(f"Error calculating position size: {e}")
-            return 0
 
 
     def _validate_config(self):
@@ -358,8 +273,8 @@ class SimpleTradingBot:
                 exchange_code="NSE",              # Cash market segment
                 stock_code="NIFTY",               # Underlying index
                 product_type="cash",              # Product type
-                get_market_depth=False,           # Depth not needed
-                get_exchange_quotes=True          # Get LTP, bid/ask
+                get_market_depth=str(False),           # Depth not needed
+                get_exchange_quotes=str(True)          # Get LTP, bid/ask
             )
 
             logger.info("WebSocket connection initiated and subscribed to NIFTY Spot (NSE Cash)")
@@ -390,14 +305,6 @@ class SimpleTradingBot:
         # --- Step 1: Attempt to reload last known trading position ---
         # This helps the bot resume where it left off after a restart or disconnection
         self._load_position()
-
-        # --- Step 2: Re-subscribe to the CALL strike feed if it's valid ---
-        if self.call_strike:
-            self._subscribe_option(self.call_strike, "call")
-
-        # --- Step 3: Re-subscribe to the PUT strike feed if it's valid ---
-        if self.put_strike:
-            self._subscribe_option(self.put_strike, "put")
 
 
     def _handle_ws_error(self, error):
@@ -466,8 +373,8 @@ class SimpleTradingBot:
                 exchange_code="NSE",
                 stock_code="NIFTY",
                 product_type="cash",
-                get_market_depth=False,
-                get_exchange_quotes=True
+                get_market_depth=str(False),
+                get_exchange_quotes=str(True)
             )
 
             logger.info("WebSocket reconnected and feeds subscribed.")
@@ -549,51 +456,7 @@ class SimpleTradingBot:
         # If none of the above checks failed, market is currently open
         return True
 
-
-    def _subscribe_option(self, strike, option_type):
-        """
-        Subscribes to real-time market data for a specific NIFTY option (CALL or PUT)
-        using the BreezeConnect WebSocket.
-
-        This function allows the bot to receive live updates (LTP, bid, ask) for
-        a dynamically selected strike price, which is essential for:
-        - Making informed trade decisions
-        - Logging option prices
-        - Managing SL/TP and position entry/exits
-
-        Parameters:
-            strike (int): The strike price of the option to subscribe to (e.g. 19500)
-            option_type (str): Either "call" or "put" (case-insensitive)
-
-        Behavior:
-            - All parameters are safely cast to strings, as required by the Breeze API
-            - Logs an error if subscription fails
-        """
-
-        try:
-            # --- Step 1: Call Breeze API to subscribe to option feed ---
-
-            self.breeze.subscribe_feeds(
-                exchange_code=str("NFO"),                          # NSE F&O segment
-                stock_code=str("NIFTY"),                           # Underlying instrument
-                product_type=str("options"),                       # This is an options contract
-                expiry_date=str(self._get_next_thursday_expiry()), # Format: YYYY-MM-DDT00:00:00.000Z
-                right=str(option_type).lower(),                    # Must be 'call' or 'put' in lowercase
-                strike_price=str(int(strike)),                     # Must be stringified integer
-                get_market_depth=False,                            # No market depth (to reduce load)
-                get_exchange_quotes=True                           # Get LTP, bid, ask updates
-            )
-
-            # Log confirmation of successful subscription (debug level)
-            logger.debug(f"Subscribed to {option_type.upper()} {strike} option")
-
-        except Exception as e:
-            # Log detailed error if subscription fails
-            logger.error(f"Failed to subscribe to option {option_type} {strike}: {str(e)}")
-
-
-
-    def _calculate_atr(self, period=14):
+    def _calculate_atr(self, period=1):
         """
         Calculates the Average True Range (ATR) from historical 1-minute candle data.
 
@@ -614,12 +477,12 @@ class SimpleTradingBot:
         """
 
         # --- Step 1: Ensure there are enough candles for the given ATR period ---
-        if len(self.candles) < period + 1:
+        if len(self.candle_buffer) < period + 1:
             logger.warning("Not enough candle data to calculate ATR.")
             return 0  # Not enough data to calculate ATR
 
         # --- Step 2: Extract the most recent candles required for ATR computation ---
-        recent_candles = self.candles[-(period + 1):]  # Includes one extra for prev_close reference
+        recent_candles = list(self.candle_buffer)[-(period + 1):]  # Includes one extra for prev_close reference
 
         tr_values = []  # Store all true range values
 
@@ -645,57 +508,68 @@ class SimpleTradingBot:
         atr = sum(tr_values) / period
         return atr
 
-
     def _check_sl_tp(self):
         """
-        Checks whether the current NIFTY spot price has hit the stop-loss (SL)
-        or take-profit (TP) level for the active position.
-
-        This function is invoked on every tick of NIFTY spot data.
-        It determines whether the bot should exit the current position 
-        (either long or short) based on predefined SL/TP thresholds.
-
-        Behavior:
-        - If position is 'long' (buying CALL), triggers SL if price drops too much,
-        or TP if price rises as expected.
-        - If position is 'short' (buying PUT), triggers SL if price rises too much,
-        or TP if price falls as expected.
-        - If SL or TP is hit, it executes an exit order and resets the position state.
-
-        This is a real-time risk control mechanism to limit losses and lock in profits.
+        Checks on every tick if the spot price has hit the SL or TP level.
+        If a condition is met, it logs the exit signal and executes the exit.
         """
-
-        # No active position, so nothing to monitor for SL/TP
+        # If we are not in a position, there's nothing to do.
         if not self.position:
             return
 
-        # =====================
-        # LONG POSITION HANDLING
-        # =====================
+        # --- LONG POSITION EXIT ---
         if self.position == "long":
-            # Stop-loss hit: spot has fallen to or below SL level
+            exit_reason = None
+            # Check for Stop-Loss hit
             if self.spot_price <= self.stop_loss:
+                exit_reason = "SL"
                 logger.info(f"STOP-LOSS HIT for LONG position at {self.spot_price:.2f} (SL: {self.stop_loss:.2f})")
-                self._exit("call", self.call_strike)  # Exit long via selling CALL
-
-            # Take-profit hit: spot has risen to or above TP level
+            # Check for Take-Profit hit
             elif self.spot_price >= self.take_profit:
+                exit_reason = "TP"
                 logger.info(f"TAKE-PROFIT HIT for LONG position at {self.spot_price:.2f} (TP: {self.take_profit:.2f})")
-                self._exit("call", self.call_strike)  # Exit long via selling CALL
 
-        # =====================
-        # SHORT POSITION HANDLING
-        # =====================
+            # If an exit was triggered (either SL or TP)
+            if exit_reason:
+                # 1. Log the exit signal
+                self._log_signal({
+                    'signal_type': f'EXIT_LONG_BY_{exit_reason}',
+                    'spot_price_at_signal': self.spot_price,
+                    'call_strike': self.call_strike,
+                    'put_strike': self.put_strike,
+                    'stop_loss': self.stop_loss,
+                    'take_profit': self.take_profit,
+                    'entry_price': self.entry_price
+                })
+                # 2. Execute the exit order
+                self._exit("call", self.call_strike)
+
+        # --- SHORT POSITION EXIT ---
         elif self.position == "short":
-            # Stop-loss hit: spot has risen to or above SL level (bad for short)
+            exit_reason = None
+            # Check for Stop-Loss hit
             if self.spot_price >= self.stop_loss:
+                exit_reason = "SL"
                 logger.info(f"STOP-LOSS HIT for SHORT position at {self.spot_price:.2f} (SL: {self.stop_loss:.2f})")
-                self._exit("put", self.put_strike)  # Exit short via selling PUT
-
-            # Take-profit hit: spot has fallen to or below TP level (good for short)
+            # Check for Take-Profit hit
             elif self.spot_price <= self.take_profit:
+                exit_reason = "TP"
                 logger.info(f"TAKE-PROFIT HIT for SHORT position at {self.spot_price:.2f} (TP: {self.take_profit:.2f})")
-                self._exit("put", self.put_strike)  # Exit short via selling PUT
+
+            # If an exit was triggered (either SL or TP)
+            if exit_reason:
+                # 1. Log the exit signal
+                self._log_signal({
+                    'signal_type': f'EXIT_SHORT_BY_{exit_reason}',
+                    'spot_price_at_signal': self.spot_price,
+                    'call_strike': self.call_strike,
+                    'put_strike': self.put_strike,
+                    'stop_loss': self.stop_loss,
+                    'take_profit': self.take_profit,
+                    'entry_price': self.entry_price
+                })
+                # 2. Execute the exit order
+                self._exit("put", self.put_strike)
 
 
 
@@ -882,70 +756,38 @@ class SimpleTradingBot:
     def _process_candle_data(self, ltp, tick_time_dt):
         """
         Builds 1-minute OHLC candles from incoming NIFTY spot tick data,
-        and triggers signal evaluation when a full candle completes.
-
-        This function is called on every tick of NIFTY spot. It groups all ticks
-        within the same minute into a single candle (Open, High, Low, Close), and
-        at the end of the minute, it finalizes that candle and evaluates whether
-        a trading signal should be triggered.
-
-        Parameters:
-            ltp (float): The current Last Traded Price of NIFTY (from validated tick)
-            tick_time_dt (datetime): The timestamp of the tick (from feed or fallback)
-
-        Behavior:
-            - Maintains `self.current_candle` for the ongoing minute
-            - Uses `self.last_candle_time` to detect minute boundaries
-            - Appends closed candle to `self.candles` and calls `_evaluate_signals()`
+        and triggers signal evaluation and logging when a full candle completes.
         """
-
-        # Round the tick timestamp down to the minute (e.g., 13:45:22 → 13:45:00)
         candle_time = tick_time_dt.replace(second=0, microsecond=0)
 
-        # --- Case 1: New minute → close the previous candle and start a new one ---
-        if self.last_candle_time and candle_time > self.last_candle_time:
-            # Finalize the last candle and append to the list
-            if self.current_candle:
-                self.candles.append(self.current_candle)
+        # --- Case 1: First tick ever ---
+        if self.current_candle is None:
+            self.current_candle = {'time': candle_time, 'open': ltp, 'high': ltp, 'low': ltp, 'close': ltp}
+            self.last_candle_time = candle_time
+            return # Exit here, wait for more ticks to form the first full candle
 
-                # Limit list size to avoid memory buildup (keep last 100 candles)
-                if len(self.candles) > 100:
-                    self.candles.pop(0)
+        # --- Case 2: New minute has started ---
+        if candle_time > self.last_candle_time:
+            # Finalize the last candle and add it to our history
+            self.candle_buffer.append(self.current_candle)
+            logger.debug(f"Completed candle for {self.last_candle_time.strftime('%H:%M')}: {self.current_candle}")
 
-                # Trigger signal evaluation based on completed candle
-                self._evaluate_signals()
-
-            # Start a new candle for the new minute
-            self.current_candle = {
-                'time': candle_time,
-                'open': ltp,
-                'high': ltp,
-                'low': ltp,
-                'close': ltp
-            }
-
-            # Update the last candle time to the current minute
+            # Evaluate signals based on the candle that just completed
+            self._evaluate_signals()
+            
+            # NOW, create the new candle for the current minute
+            self.current_candle = {'time': candle_time, 'open': ltp, 'high': ltp, 'low': ltp, 'close': ltp}
             self.last_candle_time = candle_time
 
-        # --- Case 2: First tick or still within the same candle minute ---
-        elif not self.last_candle_time or candle_time == self.last_candle_time:
-            # Initialize the candle if it doesn't exist
-            if not self.current_candle:
-                self.current_candle = {
-                    'time': candle_time,
-                    'open': ltp,
-                    'high': ltp,
-                    'low': ltp,
-                    'close': ltp
-                }
+            # And finally, log the minute data, which can now see the new "forming" candle
+            self._log_minute_data()
 
-            else:
-                # Update high and low values dynamically
-                self.current_candle['high'] = max(self.current_candle['high'], ltp)
-                self.current_candle['low'] = min(self.current_candle['low'], ltp)
-
-                # Always update close to latest price
-                self.current_candle['close'] = ltp
+        # --- Case 3: Still within the same minute ---
+        else:
+            # Just update the H, L, C of the current candle
+            self.current_candle['high'] = max(self.current_candle['high'], ltp)
+            self.current_candle['low'] = min(self.current_candle['low'], ltp)
+            self.current_candle['close'] = ltp
 
 
     def _log_minute_data(self):
@@ -968,10 +810,10 @@ class SimpleTradingBot:
                 logger.info("\n--- NIFTY Spot Candle Data: Not enough completed data yet ---")
 
             # Print the opening price of the current (forming) candle
-            if self.minute_candle['open'] is not None:
-                current_candle_time_str = now.replace(second=0, microsecond=0).strftime('%Y-%m-%d %H:%M:%S%z')
+            if self.current_candle and self.current_candle['open'] is not None:
+                current_candle_time_str = self.current_candle['time'].strftime('%Y-%m-%d %H:%M:%S%z')
                 logger.info(f"\n--- Current (Forming) Candle ({current_candle_time_str}) ---")
-                logger.info(f"Opening Price: {self.minute_candle['open']:.2f}")
+                logger.info(f"Opening Price: {self.current_candle['open']:.2f}")
             else:
                 logger.info("\n--- Current (Forming) Candle: Not yet started ---")
 
@@ -1027,8 +869,6 @@ class SimpleTradingBot:
                 for cond, status in sell_conditions.items():
                     logger.info(f"- {cond}: {status}")
                 logger.info(f"Sell Conditions Summary: {true_sell_conditions} True, {false_sell_conditions} False")
-                logger.info(f"are option prices ready: {self._are_option_prices_ready()}")
-
             else:
                 logger.info("\n--- Not enough candle data to evaluate buy/sell conditions ---")
 
@@ -1070,13 +910,10 @@ class SimpleTradingBot:
         # --- Step 3: If CALL strike has changed, update and subscribe ---
         if call_strike != self.call_strike and call_strike > 0:
             self.call_strike = call_strike  # Update internal reference
-            self._subscribe_option(call_strike, "call")  # Subscribe to new strike
 
         # --- Step 4: If PUT strike has changed, update and subscribe ---
         if put_strike != self.put_strike and put_strike > 0:
             self.put_strike = put_strike  # Update internal reference
-            self._subscribe_option(put_strike, "put")  # Subscribe to new strike
-
 
     def _evaluate_signals(self):
         """
@@ -1104,13 +941,9 @@ class SimpleTradingBot:
         try:
             df = pd.DataFrame(list(self.candle_buffer))
 
-            if not self._validate_candle_data(df):
-                return
 
             # Validate market conditions first
-            is_valid, reason = self._validate_market_conditions()
-            if not is_valid:
-                logger.debug(f"Skipping signal evaluation: {reason}")
+            if not self._validate_market_conditions():
                 return
 
             atr = self._calculate_atr()
@@ -1118,11 +951,7 @@ class SimpleTradingBot:
                 logger.warning("Could not calculate ATR, skipping signal evaluation.")
                 return
 
-            # if not self._are_option_prices_ready():
-            #     logger.debug("Skipping signal evaluation: Option LTP/Bid/Ask data not ready.")
-            #     return
-
-            dynamic_quantity = self._calculate_position_size(atr)
+            dynamic_quantity = self.quantity
             atr_multiplier = 1.5
             rr_ratio = 2.0
 
@@ -1135,59 +964,6 @@ class SimpleTradingBot:
             reversed_position = False
             current_price = self.spot_price
 
-            # === Exit logic: SL or TP hit ===
-            if self.position == "long" and self.stop_loss and self.take_profit:
-                if current_price <= self.stop_loss or current_price >= self.take_profit:
-                    logger.info(f"LONG position exit triggered. Price: {current_price}, SL: {self.stop_loss}, TP: {self.take_profit}")
-                    self._log_signal({
-                        'signal_type': 'EXIT_LONG_BY_' + ('SL' if current_price <= self.stop_loss else 'TP'),
-                        'spot_price_at_signal': current_price,
-                        'call_strike': self.call_strike,
-                        'put_strike': self.put_strike,
-                        'current_candle_open': current['open'],
-                        'current_candle_high': current['high'],
-                        'current_candle_low': current['low'],
-                        'current_candle_close': current['close'],
-                        'prev_candle_open': prev['open'],
-                        'prev_candle_high': prev['high'],
-                        'prev_candle_low': prev['low'],
-                        'prev_candle_close': prev['close'],
-                        'atr': atr,
-                        'dynamic_quantity': dynamic_quantity,
-                        'position_before_signal': self.position,
-                        'call_ltp': self.call_option_data.get('ltp'),
-                        'put_ltp': self.put_option_data.get('ltp'),
-                    })
-                    self._exit("call", self.call_strike)
-                    self.position = None
-                    reversed_position = True
-
-            elif self.position == "short" and self.stop_loss and self.take_profit:
-                if current_price >= self.stop_loss or current_price <= self.take_profit:
-                    logger.info(f"SHORT position exit triggered. Price: {current_price}, SL: {self.stop_loss}, TP: {self.take_profit}")
-                    self._log_signal({
-                        'signal_type': 'EXIT_SHORT_BY_' + ('SL' if current_price >= self.stop_loss else 'TP'),
-                        'spot_price_at_signal': current_price,
-                        'call_strike': self.call_strike,
-                        'put_strike': self.put_strike,
-                        'current_candle_open': current['open'],
-                        'current_candle_high': current['high'],
-                        'current_candle_low': current['low'],
-                        'current_candle_close': current['close'],
-                        'prev_candle_open': prev['open'],
-                        'prev_candle_high': prev['high'],
-                        'prev_candle_low': prev['low'],
-                        'prev_candle_close': prev['close'],
-                        'atr': atr,
-                        'dynamic_quantity': dynamic_quantity,
-                        'position_before_signal': self.position,
-                        'put_ltp': self.put_option_data.get('ltp'),
-                        'call_ltp': self.call_option_data.get('ltp'),
-                    })
-                    self._exit("put", self.put_strike)
-                    self.position = None
-                    reversed_position = True
-
             # Entry Long
             if (self.position is None or reversed_position) and buy_signal_triggered:
                 logger.info("Entry Long signal detected")
@@ -1196,27 +972,17 @@ class SimpleTradingBot:
                     'spot_price_at_signal': self.spot_price,
                     'call_strike': self.call_strike,
                     'put_strike': self.put_strike,
-                    'current_candle_open': current['open'],
-                    'current_candle_high': current['high'],
-                    'current_candle_low': current['low'],
-                    'current_candle_close': current['close'],
-                    'prev_candle_open': prev['open'],
-                    'prev_candle_high': prev['high'],
-                    'prev_candle_low': prev['low'],
-                    'prev_candle_close': prev['close'],
-                    'atr': atr,
-                    'dynamic_quantity': dynamic_quantity,
-                    'position_before_signal': self.position,
-                    'call_ltp': self.call_option_data.get('ltp'),
-                    'call_bid': self.call_option_data.get('bid'),
-                    'call_ask': self.call_option_data.get('ask'),
-                    'put_ltp': self.put_option_data.get('ltp'),
-                    'put_bid': self.put_option_data.get('bid'),
-                    'put_ask': self.put_option_data.get('ask')
+                    'stop loss' : self.stop_loss,
+                    'take profit' : self.take_profit
                 })
-                self.entry_price = self.minute_candle['open']
-                self.stop_loss = current['low'] - (atr * atr_multiplier)
-                self.take_profit = self.entry_price + ((self.entry_price - self.stop_loss) * rr_ratio)
+                self.entry_price = current['open']
+                self.stop_loss = current['low']  # SL is current bullish candle's low
+                risk = self.entry_price - self.stop_loss
+                if risk <= 0:
+                    logger.warning("Invalid risk for long trade. Skipping.")
+                    return
+                self.take_profit = self.entry_price + 4 * risk  # 1:4 RR
+
                 logger.info(f"ENTERING LONG. Entry: {self.entry_price:.2f}, SL: {self.stop_loss:.2f}, TP: {self.take_profit:.2f}, Qty: {dynamic_quantity}")
                 old_quantity = self.quantity
                 self.quantity = dynamic_quantity
@@ -1234,27 +1000,17 @@ class SimpleTradingBot:
                     'spot_price_at_signal': self.spot_price,
                     'call_strike': self.call_strike,
                     'put_strike': self.put_strike,
-                    'current_candle_open': current['open'],
-                    'current_candle_high': current['high'],
-                    'current_candle_low': current['low'],
-                    'current_candle_close': current['close'],
-                    'prev_candle_open': prev['open'],
-                    'prev_candle_high': prev['high'],
-                    'prev_candle_low': prev['low'],
-                    'prev_candle_close': prev['close'],
-                    'atr': atr,
-                    'dynamic_quantity': dynamic_quantity,
-                    'position_before_signal': self.position,
-                    'call_ltp': self.call_option_data.get('ltp'),
-                    'call_bid': self.call_option_data.get('bid'),
-                    'call_ask': self.call_option_data.get('ask'),
-                    'put_ltp': self.put_option_data.get('ltp'),
-                    'put_bid': self.put_option_data.get('bid'),
-                    'put_ask': self.put_option_data.get('ask')
+                    'stop loss' : self.stop_loss,
+                    'take profit' : self.take_profit
                 })
-                self.entry_price = self.minute_candle['open']
-                self.stop_loss = current['high'] + (atr * atr_multiplier)
-                self.take_profit = self.entry_price - ((self.stop_loss - self.entry_price) * rr_ratio)
+                self.entry_price = current['open']
+                self.stop_loss = current['high']  # SL is current bearish candle's high
+                risk = self.stop_loss - self.entry_price
+                if risk <= 0:
+                    logger.warning("Invalid risk for short trade. Skipping.")
+                    return
+                self.take_profit = self.entry_price - 4 * risk  # 1:4 RR       
+                
                 logger.info(f"ENTERING SHORT. Entry: {self.entry_price:.2f}, SL: {self.stop_loss:.2f}, TP: {self.take_profit:.2f}, Qty: {dynamic_quantity}")
                 old_quantity = self.quantity
                 self.quantity = dynamic_quantity
@@ -1301,7 +1057,7 @@ class SimpleTradingBot:
                 logger.warning(f"Invalid value for '{key}' in candle: {value}")
                 return False
 
-        # ✅ All checks passed — the candle is valid
+        # All checks passed — the candle is valid
         return True
 
 
@@ -1548,15 +1304,15 @@ class SimpleTradingBot:
             order_response = self.breeze.place_order(
                 stock_code="NIFTY",                         # Trading NIFTY options
                 exchange_code="NFO",                        # NSE Futures & Options segment
-                product_type="options",                     # Type of instrument
+                product="options",                     # Type of instrument
                 expiry_date=self._get_next_thursday_expiry(),  # Dynamically get next weekly expiry
-                option_type=option_type,                    # 'call' or 'put'
+                right=option_type,                    # 'call' or 'put'
                 strike_price=str(int(strike)),              # Strike must be stringified int
                 action=action,                              # 'buy' or 'sell'
                 order_type="market",                        # Market order
                 quantity=str(self.quantity),                # Order quantity (as string)
                 price=0,                                    # Required field; 0 for market orders
-                validity="day"                              # Valid for the trading day
+                validity="day",                             # Valid for the trading day
             )
 
             # --- Step 5: Log successful order placement ---
